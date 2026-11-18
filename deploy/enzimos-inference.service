@@ -1,0 +1,33 @@
+[Unit]
+Description=enzimOS local inference supervisor
+After=enzimos-ai-setup.service
+ConditionPathExists=%E/enzimos/inference.json
+PartOf=enzui-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/enzimos-inference --config "%E/enzimos/inference.json" --preferences %S/enzimos-inference/preferences.json --socket %t/enzimos-inference/service.sock
+RuntimeDirectory=enzimos-inference
+RuntimeDirectoryMode=0700
+StateDirectory=enzimos-inference
+StateDirectoryMode=0700
+UMask=0077
+Nice=15
+CPUWeight=20
+CPUQuota=200%
+IOWeight=10
+MemoryHigh=2400M
+MemoryMax=2688M
+MemorySwapMax=0
+TasksMax=64
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t/enzimos-inference
+KillMode=control-group
+TimeoutStopSec=10
+Restart=on-failure
+[Install]
+WantedBy=enzui-session.target

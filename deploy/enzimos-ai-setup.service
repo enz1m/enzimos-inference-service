@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Set up on-device AI for this account (first login)
+ConditionPathExists=|!%E/enzimos/inference.json
+ConditionPathExists=|!%E/enzimos/ai-providers.json
+PartOf=enzui-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/enzimos-inference-models setup
+Environment=XDG_CONFIG_HOME=%E
+[Install]
+WantedBy=enzui-session.target

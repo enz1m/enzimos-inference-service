@@ -1,0 +1,10 @@
+/target/
+__pycache__/
+*.pyc
+.local/
+/work/
+/build/
+/dist/
+*.gguf
+*.bin
+*.sock
