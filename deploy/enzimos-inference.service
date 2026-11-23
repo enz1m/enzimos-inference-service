@@ -2,6 +2,7 @@
 Description=enzimOS local inference supervisor
 After=enzimos-ai-setup.service
 ConditionPathExists=%E/enzimos/inference.json
+ConditionPathExists=!%E/enzimos/local-ai-disabled
 PartOf=enzui-session.target
 
 [Service]

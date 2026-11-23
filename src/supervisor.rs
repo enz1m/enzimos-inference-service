@@ -157,8 +157,7 @@ impl Supervisor {
             if backend != "auto" && checked["runtimes"].get(backend).is_none() {
                 return Err("requested runtime not installed".into());
             }
-            let model = value["default_model"].as_str().unwrap_or_default();
-            if checked["models"].get(model).is_none() || policy::kind(&checked, model) != "llm" {
+            if !policy::valid_text_default(&checked, &value["default_model"]) {
                 return Err("registered text model required".into());
             }
             Ok(value)

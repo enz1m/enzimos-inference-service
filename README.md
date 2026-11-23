@@ -41,7 +41,7 @@ enzimos-inference-models list
 enzimos-inference-models remove ID
 enzimos-inference-models add /usr/share/enzimos/models/X.gguf --system  # a shipped model, used in place
 enzimos-inference-models add ~/sherpa-onnx-moonshine-base-en-int8 --id moonshine-base  # a speech model folder
-enzimos-inference-models catalog                         # speech models fetch can download
+enzimos-inference-models catalog                         # text and speech downloads
 enzimos-inference-models fetch parakeet-tdt-0.6b-v3 --default   # download, verify, add, use for dictation
 enzimos-inference-models default whisper-base            # the speech (or text) model to use
 ```
@@ -52,8 +52,8 @@ and a read-only copy is kept under `~/.local/share/enzimos/models/<sha256>`. The
 `--system` registers a model the system installed where it is, without a copy,
 only when root owns it and its folder and nobody else can change them. The
 registry is created from the installed runtimes when missing and rewritten
-atomically only when it still validates; the service is restarted. Settings ›
-Agents › Add a model… runs the same command.
+atomically only when it still validates. Settings › Agents can import a model
+file or a speech model folder. The service reloads the registry on restart.
 
 A speech model folder in the sherpa-onnx layout is identified by its files:
 Parakeet TDT (`encoder`, `decoder`, `joiner` ONNX files and `tokens.txt`; the
@@ -66,16 +66,11 @@ lines in role order. `--system` uses a root-owned folder in place when it, its
 parent and its files are protected. Folder models need the sherpa-onnx runtime
 (`enzimos-sherpa-onnx-cpu`, `/usr/lib/enzimos-inference/speech-onnx/`).
 
-Only `fetch` downloads, and only on that explicit command: it takes a model from
-the built-in catalog (`src/models/folder.rs`), downloads its sherpa-onnx release
-tarball over HTTPS with `curl`, refuses it unless its SHA-256 is the pinned one,
-unpacks it with `tar` in a private scratch folder (removed afterwards) and adds
-the folder as above.
-
-| id | tarball | SHA-256 |
-|---|---|---|
-| `parakeet-tdt-0.6b-v3` | `asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2` (487 MB) | `5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf` |
-| `moonshine-base` | `asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2` (251 MB) | `21870cecaa2e44e4e2bf63e02d1072bed183ccd10284871353bd9d24dad14e5e` |
+`fetch ID` downloads an explicit choice from the [built-in catalog](src/models/catalog.rs)
+over HTTPS and verifies its pinned SHA-256 before importing it. The catalog
+offers LFM3-VL-2B for text, Qwen3.5 0.8B, Parakeet TDT and Moonshine. LFM3
+requires a CPU runtime that declares support for its architecture. Downloads
+use private scratch space on the same filesystem as the model store.
 
 `--default` on a speech model, or `default ID`, records `default_speech_model`;
 `GET /v1/models` marks it, and the default text model, with `"default": true`,

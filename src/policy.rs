@@ -312,11 +312,8 @@ pub fn validate(config: &Value, verify: bool) -> Result<(), String> {
             return Err("model digest mismatch".into());
         }
     }
-    if !config["default_model"]
-        .as_str()
-        .is_some_and(|m| models.contains_key(m))
-    {
-        return Err("default model absent".into());
+    if !valid_text_default(config, &config["default_model"]) {
+        return Err("default text model invalid".into());
     }
     if let Some(speech) = config.get("default_speech_model")
         && !speech
@@ -326,6 +323,17 @@ pub fn validate(config: &Value, verify: bool) -> Result<(), String> {
         return Err("default speech model absent".into());
     }
     Ok(())
+}
+
+pub(crate) fn valid_text_default(config: &Value, default: &Value) -> bool {
+    let Some(models) = config["models"].as_object() else {
+        return false;
+    };
+    match default {
+        Value::Null => !models.keys().any(|id| kind(config, id) == "llm"),
+        Value::String(id) => models.contains_key(id) && kind(config, id) == "llm",
+        _ => false,
+    }
 }
 
 pub fn kind(config: &Value, model: &str) -> String {

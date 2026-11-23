@@ -244,57 +244,6 @@ pub fn validate(item: &Value, verify: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// One speech model the catalog offers to fetch: a sherpa-onnx release
-/// tarball, pinned by the digest it was verified with.
-#[derive(Debug)]
-pub struct Offer {
-    /// The registry id it gets.
-    pub id: &'static str,
-    /// What Settings shows.
-    pub title: &'static str,
-    /// `parakeet-tdt` or `moonshine`.
-    pub architecture: &'static str,
-    /// The languages it understands.
-    pub languages: &'static str,
-    /// The tarball (tar.bz2).
-    pub url: &'static str,
-    /// The tarball's SHA-256.
-    pub sha256: &'static str,
-    /// The tarball's size in bytes.
-    pub bytes: u64,
-    /// The model folder inside the tarball.
-    pub folder: &'static str,
-}
-
-/// The speech models `enzimos-inference-models fetch` can download.
-pub const CATALOG: [Offer; 2] = [
-    Offer {
-        id: "parakeet-tdt-0.6b-v3",
-        title: "Parakeet TDT 0.6B v3 (int8)",
-        architecture: "parakeet-tdt",
-        languages: "25 European languages, detected automatically",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
-        sha256: "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf",
-        bytes: 487_170_055,
-        folder: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-    },
-    Offer {
-        id: "moonshine-base",
-        title: "Moonshine base (int8)",
-        architecture: "moonshine",
-        languages: "English",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2",
-        sha256: "21870cecaa2e44e4e2bf63e02d1072bed183ccd10284871353bd9d24dad14e5e",
-        bytes: 250_807_309,
-        folder: "sherpa-onnx-moonshine-base-en-int8",
-    },
-];
-
-/// The catalog entry `id`.
-pub fn offer(id: &str) -> Option<&'static Offer> {
-    CATALOG.iter().find(|offer| offer.id == id)
-}
-
 /// Unpacks a tar.bz2 `archive` into `into` with the system `tar`.
 ///
 /// # Errors

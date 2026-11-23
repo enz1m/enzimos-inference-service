@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
+pub mod catalog;
 pub mod folder;
 
 /// Where the installed packages put the runtimes.
@@ -396,13 +397,10 @@ fn add_folder(
     Ok(alias)
 }
 
-/// Downloads catalog model `id` with `download(url, file)`, checks the
-/// tarball's digest against the catalog's, unpacks it in `work` and adds the
-/// model folder as a copy in `store`. `work` is removed afterwards.
+/// Downloads and verifies a catalog model before registering it.
 ///
 /// # Errors
-/// No such offer, no runtime for it, the download fails or its digest
-/// differs (nothing is added), or adding fails; `config` is then unchanged.
+/// The offer or its runtime is unavailable, or the download fails validation.
 pub fn fetch(
     config: &mut Value,
     store: &Path,
@@ -411,15 +409,9 @@ pub fn fetch(
     default: bool,
     download: impl FnOnce(&str, &Path) -> Result<(), String>,
 ) -> Result<String, String> {
-    let offer = folder::offer(id).ok_or_else(|| {
-        let ids: Vec<&str> = folder::CATALOG.iter().map(|offer| offer.id).collect();
-        format!("no catalog model named {id} (offered: {})", ids.join(", "))
-    })?;
-    if !config["speech"]["onnx"].is_string() {
-        return Err(
-            "the speech runtime for this model is not installed (enzimos-sherpa-onnx-cpu)"
-                .to_owned(),
-        );
+    let offer = catalog::offer(id).ok_or_else(|| format!("no catalog model named {id}"))?;
+    if !offer.available(config) {
+        return Err("the runtime for this model is not installed".into());
     }
     struct Scratch<'a>(&'a Path);
     impl Drop for Scratch<'_> {
@@ -427,30 +419,44 @@ pub fn fetch(
             let _ = std::fs::remove_dir_all(self.0);
         }
     }
-    if work.exists() {
-        std::fs::remove_dir_all(work).map_err(|error| format!("{}: {error}", work.display()))?;
-    }
-    std::fs::create_dir_all(work.join("unpacked"))
-        .map_err(|error| format!("{}: {error}", work.display()))?;
+    std::fs::create_dir_all(work).map_err(|error| error.to_string())?;
     let _scratch = Scratch(work);
     set_mode(work, 0o700)?;
-    let archive = work.join("download.tar.bz2");
-    download(offer.url, &archive)?;
-    let sha =
-        policy::file_sha256(&archive).map_err(|error| format!("reading the download: {error}"))?;
-    if sha != offer.sha256 {
-        return Err(format!(
-            "the download's digest {sha} does not match the catalog's {}; nothing was added",
-            offer.sha256
-        ));
-    }
-    folder::unpack(&archive, &work.join("unpacked"))?;
-    let _ = std::fs::remove_file(&archive);
-    let source = work.join("unpacked").join(offer.folder);
-    let identity = identify(&source)?;
-    if identity.architecture.as_deref() != Some(offer.architecture) {
-        return Err("the download is not the model the catalog names".to_owned());
-    }
+    let downloaded = work.join("download");
+    download(offer.url, &downloaded)?;
+    let source = match offer.format {
+        catalog::Format::Text => {
+            return add(
+                config,
+                Keep::Copy(store),
+                &downloaded,
+                Some(offer.id),
+                Some(offer.sha256),
+                default,
+            );
+        }
+        catalog::Format::Speech {
+            folder: name,
+            architecture,
+        } => {
+            let sha = policy::file_sha256(&downloaded)
+                .map_err(|error| format!("reading the download: {error}"))?;
+            if sha != offer.sha256 {
+                return Err(format!(
+                    "the download's SHA-256 does not match the catalog entry for {}; no model was added",
+                    offer.title
+                ));
+            }
+            let unpacked = work.join("unpacked");
+            std::fs::create_dir(&unpacked).map_err(|error| error.to_string())?;
+            folder::unpack(&downloaded, &unpacked)?;
+            let source = unpacked.join(name);
+            if identify(&source)?.architecture.as_deref() != Some(architecture) {
+                return Err("the download is not the speech model the catalog names".into());
+            }
+            source
+        }
+    };
     add(
         config,
         Keep::Copy(store),
@@ -1159,7 +1165,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("does not match the catalog"), "{error}");
-        assert_eq!(asked, [folder::offer("moonshine-base").unwrap().url]);
+        assert_eq!(asked, [catalog::offer("moonshine-base").unwrap().url]);
         assert_eq!(config, before);
         assert!(!work.exists(), "the download is deleted");
         assert_eq!(
@@ -1183,12 +1189,11 @@ mod tests {
             )
             .is_err()
         );
-        for offer in &folder::CATALOG {
+        for offer in &catalog::CATALOG {
             assert!(
                 policy::hex64(offer.sha256) && offer.url.starts_with("https://"),
                 "{offer:?}"
             );
-            assert!(offer.url.ends_with(&format!("/{}.tar.bz2", offer.folder)));
         }
     }
 }

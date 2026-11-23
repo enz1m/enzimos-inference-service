@@ -8,14 +8,15 @@
 //! folder), checked, kept read-only under `~/.local/share/enzimos/models` and
 //! registered by its digest. `--system` registers a model the system installed
 //! (root-owned, such as /usr/share/enzimos/models) where it is, without a copy.
-//! Only `fetch` downloads: a speech model from the built-in `catalog`, checked
-//! against the digest pinned there. `--default` and `default` choose the text
+//! Downloads from the built-in catalog are verified before registration. `--default` and `default` choose the text
 //! model the service answers with, or the speech model dictation uses. The
 //! running service is restarted to pick the change up.
 use enzimos_inference_service::models;
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 const USAGE: &str = "usage: enzimos-inference-models setup | list | catalog | add PATH [--id ID] [--sha256 HEX] [--default] [--system] | fetch ID [--default] | default ID | remove ID";
 
@@ -26,9 +27,8 @@ fn home(var: &str, fallback: &str) -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback)))
 }
 
-/// Downloads `url` to `file` over HTTPS only, with curl.
-fn download(url: &str, file: &std::path::Path) -> Result<(), String> {
-    let status = std::process::Command::new("curl")
+fn download(url: &str, file: &std::path::Path, bytes: u64) -> Result<(), String> {
+    let mut curl = std::process::Command::new("curl")
         .args([
             "--fail",
             "--location",
@@ -38,20 +38,56 @@ fn download(url: &str, file: &std::path::Path) -> Result<(), String> {
             "=https",
             "--proto-redir",
             "=https",
+            "--connect-timeout",
+            "15",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "45",
+            "--max-time",
+            "7200",
             "--max-filesize",
-            "2000000000",
+            &bytes.to_string(),
             "--output",
         ])
         .arg(file)
         .arg(url)
         .stdin(std::process::Stdio::null())
-        .status()
+        .spawn()
         .map_err(|error| format!("curl: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("the download failed".to_owned())
+    let mut previous = None;
+    loop {
+        match curl.try_wait().map_err(|error| error.to_string())? {
+            Some(status) if status.success() => {
+                let _ = writeln!(std::io::stdout(), "verifying");
+                return Ok(());
+            }
+            Some(status) => return Err(format!("the download failed ({status})")),
+            None => {}
+        }
+        if let Ok(meta) = file.metadata() {
+            let done = meta.len().min(bytes);
+            if previous != Some(done) {
+                let _ = writeln!(std::io::stdout(), "progress\t{done}\t{bytes}");
+                previous = Some(done);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+fn registry_lock(config_dir: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(config_dir).map_err(|error| error.to_string())?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(config_dir.join("inference-models.lock"))
+        .map_err(|error| error.to_string())?;
+    lock.try_lock()
+        .map_err(|_| "another model change is in progress")?;
+    Ok(lock)
 }
 
 fn main() -> ExitCode {
@@ -77,6 +113,20 @@ fn main() -> ExitCode {
             }
         };
     }
+    let _lock = if matches!(
+        args.first().map(String::as_str),
+        Some("add" | "fetch" | "default" | "remove")
+    ) {
+        match registry_lock(&config_dir) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("enzimos-inference-models: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let path = config_dir.join("inference.json");
     let store = data_home.join("enzimos/models");
     let mut config = match std::fs::read(&path) {
@@ -155,19 +205,29 @@ fn main() -> ExitCode {
         }
         Some("catalog") if args.len() == 1 => {
             let mut out = std::io::stdout();
-            for offer in &models::folder::CATALOG {
+            for offer in models::catalog::CATALOG
+                .iter()
+                .filter(|offer| offer.base_runtime_available(&config))
+            {
                 let state = if config["models"].get(offer.id).is_some() {
                     "added"
-                } else {
+                } else if offer.available(&config) {
                     "available"
+                } else {
+                    "requires-runtime"
                 };
                 let _ = writeln!(
                     out,
-                    "{}\t{}\t{} MB\t{}\t{state}",
+                    "{}\t{}\t{} MB\t{}\t{state}{}",
                     offer.id,
                     offer.title,
                     offer.bytes / 1_000_000,
-                    offer.languages
+                    offer.description,
+                    if matches!(offer.format, models::catalog::Format::Text) {
+                        "\ttext"
+                    } else {
+                        ""
+                    }
                 );
             }
             return ExitCode::SUCCESS;
@@ -181,17 +241,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            if let Some(offer) = models::folder::offer(&args[1]) {
-                let _ = writeln!(
-                    std::io::stdout(),
-                    "downloading {} ({} MB)",
-                    offer.title,
-                    offer.bytes / 1_000_000
-                );
-            }
-            let work = store.join(format!(".fetch-{}", args[1].replace('/', "-")));
-            models::fetch(&mut config, &store, &work, &args[1], default, download)
-                .map(|alias| format!("added {alias}"))
+            fetch(&mut config, &store, &args[1], default)
         }
         Some("default") if args.len() == 2 => {
             models::set_default(&mut config, &args[1]).map(|()| format!("default {}", args[1]))
@@ -221,4 +271,30 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn fetch(
+    config: &mut serde_json::Value,
+    store: &std::path::Path,
+    id: &str,
+    default: bool,
+) -> Result<String, String> {
+    let offer = models::catalog::offer(id)
+        .filter(|offer| offer.available(config))
+        .ok_or_else(|| "the selected model or its runtime is unavailable".to_owned())?;
+    if config["models"].get(id).is_some() {
+        if default {
+            models::set_default(config, id)?;
+        }
+        return Ok(format!("added {id}"));
+    }
+    std::fs::create_dir_all(store).map_err(|error| error.to_string())?;
+    let scratch = tempfile::Builder::new()
+        .prefix(".fetch-")
+        .tempdir_in(store)
+        .map_err(|error| error.to_string())?;
+    models::fetch(config, store, scratch.path(), id, default, |url, path| {
+        download(url, path, offer.bytes)
+    })
+    .map(|alias| format!("added {alias}"))
 }
