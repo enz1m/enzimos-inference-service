@@ -39,6 +39,7 @@ pub(super) fn spawn(
     env: &[(String, String)],
     cpus: Vec<u32>,
     output: Option<&Path>,
+    capture_errors: bool,
 ) -> std::io::Result<Child> {
     let stdout = match output {
         Some(path) => {
@@ -60,7 +61,11 @@ pub(super) fn spawn(
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(stdout)
-        .stderr(Stdio::null())
+        .stderr(if capture_errors {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .kill_on_drop(true);
     unsafe { command.pre_exec(harden(cpus, libc::getpid())) };
     command.spawn()
@@ -124,4 +129,28 @@ pub(super) fn driver_ram_mib(pid: u32) -> f64 {
         clients.insert((rows.get("drm-pdev").cloned(), client.clone()), total);
     }
     clients.values().sum::<f64>() / (1024.0 * 1024.0)
+}
+
+pub(super) async fn model_load_error(
+    mut stderr: tokio::process::ChildStderr,
+) -> Option<&'static str> {
+    let mut chunk = [0; 4096];
+    let mut tail = String::new();
+    let mut failure = None;
+    while let Ok(n @ 1..) = stderr.read(&mut chunk).await {
+        tail.push_str(&String::from_utf8_lossy(&chunk[..n]).to_ascii_lowercase());
+        if tail.contains("unknown model architecture")
+            || tail.contains("unsupported model architecture")
+        {
+            failure = Some("model-unsupported-architecture");
+        } else if failure.is_none()
+            && (tail.contains("out of memory")
+                || tail.contains("failed to allocate")
+                || tail.contains("cannot allocate memory"))
+        {
+            failure = Some("model-out-of-memory");
+        }
+        tail.drain(..tail.floor_char_boundary(tail.len().saturating_sub(128)));
+    }
+    failure
 }

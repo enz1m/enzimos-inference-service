@@ -24,8 +24,20 @@ pub enum Failure {
     Bad(String),
     Conflict(String),
     Unavailable(String),
+    /// A model load failure with a public, machine-readable code.
+    ModelLoad(&'static str),
     Closed,
 }
+const MEMORY_BUDGET_EXCEEDED: &str = "model exceeded the configured RAM budget";
+
+fn inference_failure(failure: Option<String>, fallback: &str) -> Failure {
+    match failure.as_deref() {
+        Some(MEMORY_BUDGET_EXCEEDED) => Failure::ModelLoad("model-out-of-memory"),
+        Some(message) => unavailable(message),
+        None => unavailable(fallback),
+    }
+}
+
 fn bad(m: impl Into<String>) -> Failure {
     Failure::Bad(m.into())
 }
@@ -352,6 +364,7 @@ impl Supervisor {
             candidates.push("cpu".into());
         }
         let cpus = self.worker_cpus();
+        let mut load_error = None;
         for backend in candidates {
             let profile = if backend == selected {
                 plan.clone()
@@ -422,8 +435,12 @@ impl Supervisor {
                 )),
                 None => env.push(("MESA_SHADER_CACHE_DISABLE".into(), "true".into())),
             }
-            let child = spawn(&args, &env, cpus.clone(), None)
+            let mut child = spawn(&args, &env, cpus.clone(), None, true)
                 .map_err(|_| unavailable("runtime could not start"))?;
+            let diagnostic = child
+                .stderr
+                .take()
+                .map(|stderr| tokio::spawn(process::model_load_error(stderr)));
             self.state.lock().unwrap().pid = child.id();
             engine.child = Some(child);
             self.started.notify_one();
@@ -442,11 +459,21 @@ impl Supervisor {
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
             self.stop(engine).await;
+            load_error = if let Some(diagnostic) = diagnostic {
+                tokio::time::timeout(Duration::from_millis(250), diagnostic)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
+            } else {
+                None
+            };
         }
         let failure = self.state.lock().unwrap().failure.clone();
-        Err(unavailable(failure.unwrap_or_else(|| {
-            "runtime could not load model within budget".into()
-        })))
+        Err(load_error.map_or_else(
+            || inference_failure(failure, "runtime could not load model within budget"),
+            Failure::ModelLoad,
+        ))
     }
 
     fn admit(&self) -> Result<Job<'_>, ()> {
@@ -485,13 +512,7 @@ impl Supervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .loaded
             .clone();
-        if loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded != &model || seed.is_none())
-            || engine.cache_key.is_some()
-        {
-            return skipped;
-        }
+        let same_model = loaded.as_deref() == Some(model.as_str());
         let prefix = if let Some(Value::Object(mut seed)) = seed {
             seed.insert("model".into(), json!(model));
             static_prefix("/v1/chat/completions", &seed).filter(|_| {
@@ -502,9 +523,20 @@ impl Supervisor {
         } else {
             None
         };
-        if !available_memory_mib().is_some_and(|available| {
-            available >= policy::memory_mib(&config) + IDLE_MEMORY_RESERVE_MIB
-        }) {
+        if same_model
+            && (prefix.is_none()
+                || engine
+                    .cache_key
+                    .as_ref()
+                    .is_some_and(|key| key.prefix == prefix))
+        {
+            return skipped;
+        }
+        if !same_model
+            && !available_memory_mib().is_some_and(|available| {
+                available >= policy::memory_mib(&config) + IDLE_MEMORY_RESERVE_MIB
+            })
+        {
             return skipped;
         }
         let Ok(_job) = self.admit() else {
@@ -519,7 +551,7 @@ impl Supervisor {
         let prefix_requested = prefix.is_some();
         let mut prefetched = false;
         if let Some(prefix) = prefix {
-            let _boost = Boost::while_processing();
+            engine.cache_key = None;
             prefetched = tokio::time::timeout(
                 Duration::from_secs(15),
                 crate::calibrate::native_request(
@@ -537,7 +569,7 @@ impl Supervisor {
                 });
             }
         }
-        engine.preloaded = loaded.is_none() || engine.preloaded;
+        engine.preloaded = !same_model || engine.preloaded;
         let mut result = json!({"warmed": true, "model": model});
         if prefix_requested {
             result["prefix_cached"] = json!(prefetched);
@@ -638,9 +670,7 @@ impl Supervisor {
             }
             if total == 0 {
                 let failure = self.state.lock().unwrap().failure.clone();
-                return Err(unavailable(
-                    failure.unwrap_or_else(|| "runtime exited before response".into()),
-                ));
+                return Err(inference_failure(failure, "runtime exited before response"));
             }
             Ok(status == OK)
         }
@@ -734,7 +764,7 @@ impl Supervisor {
                 ),
                 ("OMP_NUM_THREADS".to_owned(), cpus.len().to_string()),
             ];
-            let mut child = spawn(&args, &env, cpus, plan.output(&scratch).as_deref())
+            let mut child = spawn(&args, &env, cpus, plan.output(&scratch).as_deref(), false)
                 .map_err(|_| unavailable("speech runtime could not start"))?;
             {
                 let mut s = self.state.lock().unwrap();
@@ -813,7 +843,7 @@ impl Supervisor {
                 // Summed conservatively: some driver buffers may also appear in RSS.
                 let over = rss + driver > policy::memory_mib(&s.config);
                 if over {
-                    s.failure = Some("model exceeded the configured RAM budget".into());
+                    s.failure = Some(MEMORY_BUDGET_EXCEEDED.into());
                 }
                 (over, policy::get_u64(&s.config, "idle_seconds", 60))
             };
@@ -922,6 +952,7 @@ impl Supervisor {
             Err(Failure::Conflict(m)) => Some((409, json!({"error": m}))),
             Err(Failure::Bad(m)) => Some((400, json!({"error": m}))),
             Err(Failure::Unavailable(m)) => Some((503, json!({"error": m}))),
+            Err(Failure::ModelLoad(code)) => Some((503, json!({"error": {"code":code}}))),
         };
         if let Some((status, body)) = response.filter(|_| !started) {
             let _ = http::reply(&mut writer, status, &body).await;
