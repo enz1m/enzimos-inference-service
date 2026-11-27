@@ -44,6 +44,7 @@ pub fn identify(path: &Path) -> Result<Identity, String> {
             size: None,
         });
     }
+    model_file_size(path)?;
     let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut magic = [0_u8; 4];
@@ -61,6 +62,44 @@ pub fn identify(path: &Path) -> Result<Identity, String> {
         }),
         _ => Err("not a GGUF or whisper.cpp model".to_owned()),
     }
+}
+
+fn model_file_size(path: &Path) -> Result<u64, String> {
+    let meta = std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !meta.is_file() || meta.len() < 4 {
+        return Err("Choose a regular model file with a valid header.".into());
+    }
+    Ok(meta.len())
+}
+
+/// Checks model weights against the memory limit before copying them.
+///
+/// # Errors
+/// The source has an unsupported format or its weights alone exhaust the budget.
+pub fn check_import(config: &Value, source: &Path, budget_mib: f64) -> Result<(), String> {
+    let bytes = if source.is_dir() {
+        folder::identify(source)?
+            .files
+            .iter()
+            .try_fold(0_u64, |total, (_, name)| {
+                Ok::<_, String>(total.saturating_add(model_file_size(&source.join(name))?))
+            })?
+    } else {
+        let identity = identify(source)?;
+        if identity.kind == "speech" && !config["speech"]["cli"].is_string() {
+            return Err(
+                "Install the Whisper runtime (enzimos-whisper-cpu) to use this speech model."
+                    .into(),
+            );
+        }
+        model_file_size(source)?
+    };
+    if bytes as f64 / 1_048_576.0 >= budget_mib {
+        return Err(format!(
+            "This model's files alone exceed the {budget_mib:.0} MB local AI memory limit."
+        ));
+    }
+    Ok(())
 }
 
 fn gguf(reader: &mut impl Read) -> Result<Identity, String> {
@@ -265,7 +304,6 @@ pub fn add(
     if !config["runtimes"]["cpu"].is_object() {
         return Err("the local AI runtime is not installed (enzimos-llama-cpu)".to_owned());
     }
-    let alias = id.map_or_else(|| alias_for(&identity, source), str::to_owned);
     let sha =
         policy::file_sha256(source).map_err(|error| format!("{}: {error}", source.display()))?;
     if let Some(expected) = expected
@@ -273,6 +311,17 @@ pub fn add(
     {
         return Err("the file's digest does not match the expected one".to_owned());
     }
+    let alias = id.map_or_else(
+        || import_alias(config, alias_for(&identity, source), &sha),
+        str::to_owned,
+    );
+    let title = identity
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control))
+        .or_else(|| source.file_stem().and_then(std::ffi::OsStr::to_str))
+        .unwrap_or(&alias);
     let kept: PathBuf = match keep {
         Keep::Copy(store) => {
             std::fs::create_dir_all(store)
@@ -301,7 +350,8 @@ pub fn add(
     if !next["models"].is_object() {
         next["models"] = json!({});
     }
-    next["models"][&alias] = json!({"path": kept, "sha256": sha, "kind": identity.kind});
+    next["models"][&alias] =
+        json!({"path": kept, "sha256": sha, "kind": identity.kind, "title": title});
     if let Some(architecture) = identity
         .architecture
         .as_deref()
@@ -324,6 +374,30 @@ pub fn add(
     policy::validate(&next, false)?;
     *config = next;
     Ok(alias)
+}
+
+fn import_alias(config: &Value, mut alias: String, digest: &str) -> String {
+    if !alias.starts_with(|ch: char| ch.is_ascii_alphanumeric()) {
+        alias.insert_str(0, "model-");
+        alias.truncate(64);
+    }
+    let collisions = |id: &str| {
+        config["models"]
+            .get(id)
+            .is_some_and(|entry| entry["sha256"] != digest)
+    };
+    if !collisions(&alias) {
+        return alias;
+    }
+    for length in 12..=63 {
+        let prefix: String = alias.chars().take(63 - length).collect();
+        let suffix: String = digest.chars().take(length).collect();
+        let candidate = format!("{prefix}-{suffix}");
+        if !prefix.is_empty() && !collisions(&candidate) {
+            return candidate;
+        }
+    }
+    digest.to_owned()
 }
 
 /// [`add`] for a sherpa-onnx speech model folder: its layout's files are
@@ -370,6 +444,11 @@ fn add_folder(
     );
     let files = folder::digests(source, &layout)?;
     let manifest = folder::manifest(&files);
+    let alias = if id.is_none() {
+        import_alias(config, alias, &manifest)
+    } else {
+        alias
+    };
     if let Some(expected) = expected
         && !expected.eq_ignore_ascii_case(&manifest)
     {
@@ -388,7 +467,7 @@ fn add_folder(
         next["models"] = json!({});
     }
     next["models"][&alias] = json!({"path": kept, "sha256": manifest, "kind": "speech",
-        "architecture": layout.architecture, "files": files});
+        "architecture": layout.architecture, "files": files, "title": source.file_name().and_then(std::ffi::OsStr::to_str)});
     if default {
         next["default_speech_model"] = json!(alias);
     }

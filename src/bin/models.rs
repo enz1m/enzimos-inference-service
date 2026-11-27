@@ -91,7 +91,21 @@ fn registry_lock(config_dir: &std::path::Path) -> Result<std::fs::File, String> 
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut raw = std::env::args_os().skip(1);
+    let first = raw
+        .next()
+        .and_then(|arg| arg.into_string().ok())
+        .unwrap_or_default();
+    let source = (first == "add")
+        .then(|| raw.next())
+        .flatten()
+        .map(PathBuf::from);
+    let remaining: Result<Vec<_>, _> = raw.map(std::ffi::OsString::into_string).collect();
+    let Ok(remaining) = remaining else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let args = [first].into_iter().chain(remaining).collect::<Vec<_>>();
     let (Some(config_home), Some(data_home)) = (
         home("XDG_CONFIG_HOME", ".config"),
         home("XDG_DATA_HOME", ".local/share"),
@@ -169,12 +183,12 @@ fn main() -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
-        Some("add") if args.len() >= 2 => {
+        Some("add") if source.is_some() => {
             let mut id = None;
             let mut sha = None;
             let mut default = false;
             let mut system = false;
-            let mut rest = args[2..].iter();
+            let mut rest = args[1..].iter();
             let mut bad = false;
             while let Some(flag) = rest.next() {
                 match flag.as_str() {
@@ -189,6 +203,23 @@ fn main() -> ExitCode {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
             }
+            let Some(source) = source.as_deref() else {
+                return ExitCode::from(2);
+            };
+            if !system {
+                let budget = home("XDG_STATE_HOME", ".local/state")
+                    .and_then(|dir| {
+                        std::fs::read(dir.join("enzimos-inference/preferences.json")).ok()
+                    })
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|prefs| prefs["memory_mib"].as_f64())
+                    .filter(|mib| (256.0..=2048.0).contains(mib))
+                    .unwrap_or_else(|| enzimos_inference_service::policy::memory_mib(&config));
+                if let Err(error) = models::check_import(&config, source, budget) {
+                    eprintln!("enzimos-inference-models: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
             models::add(
                 &mut config,
                 if system {
@@ -196,7 +227,7 @@ fn main() -> ExitCode {
                 } else {
                     models::Keep::Copy(&store)
                 },
-                std::path::Path::new(&args[1]),
+                source,
                 id.as_deref(),
                 sha.as_deref(),
                 default,

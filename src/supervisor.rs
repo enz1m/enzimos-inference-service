@@ -128,6 +128,7 @@ const PREFERENCE_KEYS: [&str; 6] = [
 
 mod process;
 use process::{driver_ram_mib, rss_mib, spawn};
+mod benchmark;
 mod speech;
 
 /// Decrements the job count however the request ends, including cancellation.
@@ -603,6 +604,7 @@ impl Supervisor {
     pub async fn transcribe(
         &self,
         body: Map<String, Value>,
+        benchmark: bool,
     ) -> Result<Option<(u16, Value)>, Failure> {
         if self.state.lock().unwrap().jobs >= 2 {
             return Ok(Some((429, json!({"error": "local inference busy"}))));
@@ -680,7 +682,13 @@ impl Supervisor {
                 s.loaded = Some(model.clone());
                 s.backend = Some("cpu".into());
             }
-            let status = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
+            let started = Instant::now();
+            let wait = tokio::time::timeout(Duration::from_secs(120), child.wait());
+            let (status, memory) = if benchmark {
+                benchmark::measure_memory(self, wait).await
+            } else {
+                (wait.await, 0.0)
+            };
             {
                 let mut s = self.state.lock().unwrap();
                 s.pid = None;
@@ -701,6 +709,16 @@ impl Supervisor {
                 .ok_or_else(|| {
                     unavailable(failure.unwrap_or_else(|| "speech inference failed".into()))
                 })?;
+            if benchmark {
+                return Ok(Some((
+                    200,
+                    json!({
+                        "audio_seconds": (audio.len() - 44) as f64 / 32_000.0,
+                        "elapsed_seconds": started.elapsed().as_secs_f64(),
+                        "memory_mib": memory,
+                    }),
+                )));
+            }
             Ok(Some((200, json!({"text": text.trim(), "model": model}))))
         }
         .await
@@ -884,6 +902,9 @@ impl Supervisor {
                     // and the speech model the user chose for dictation.
                     let data = config["models"].as_object().into_iter().flatten().map(|(id, m)| {
                         let mut entry = json!({"id": id, "object": "model", "kind": m.get("kind").cloned().unwrap_or_else(|| json!("llm"))});
+                        if let Some(title) = m.get("title").filter(|title| title.is_string()) {
+                            entry["title"] = title.clone();
+                        }
                         if let Some(architecture) = m.get("architecture") {
                             entry["architecture"] = architecture.clone();
                         }
@@ -900,7 +921,10 @@ impl Supervisor {
         if request.method != "POST" {
             return Err(bad("unsupported request"));
         }
-        let limit = if matches!(path, "/v1/preferences" | "/v1/models/warmup") {
+        let limit = if matches!(
+            path,
+            "/v1/preferences" | "/v1/models/warmup" | "/v1/models/benchmark"
+        ) {
             4096
         } else {
             3 * 1024 * 1024
@@ -921,7 +945,8 @@ impl Supervisor {
         // The caller disconnecting cancels the job; Abort and Job guards clean up.
         let operation = async {
             match path {
-                "/v1/audio/transcriptions" => self.transcribe(body).await,
+                "/v1/audio/transcriptions" => self.transcribe(body, false).await,
+                "/v1/models/benchmark" => self.benchmark(body).await,
                 "/v1/models/warmup" => self.warmup(body).await,
                 _ => self.proxy(path, body, writer, started).await,
             }
