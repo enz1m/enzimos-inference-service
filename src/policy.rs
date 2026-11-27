@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs, io::Read, os::unix::fs::MetadataExt, path::Path};
 
 pub const BACKENDS: [&str; 4] = ["cpu", "vulkan", "sycl", "cuda"];
+const LFM3_Q4_SHA: &str = "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb";
+const LFM3_PROJECTOR: &str = "/usr/share/enzimos/models/mmproj-LFM3-VL-2B-Q8_0.gguf";
+const LFM3_PROJECTOR_SHA: &str =
+    "c5c5b58d544a18da919172d2d0368090ea1a4a351b6feb7f8a326a264a5918ab";
 
 pub fn get_u64(config: &Value, key: &str, default: u64) -> u64 {
     config.get(key).and_then(Value::as_u64).unwrap_or(default)
@@ -561,6 +565,15 @@ pub fn server_command(
     };
     if device.is_empty() {
         return Err("GPU device must be explicit".into());
+    }
+    let projector = Path::new(LFM3_PROJECTOR);
+    if item["sha256"] == LFM3_Q4_SHA && projector.is_file() {
+        if !digest_matches(projector, LFM3_PROJECTOR_SHA)
+            .map_err(|_| "could not verify the vision projector")?
+        {
+            return Err("vision projector digest mismatch".into());
+        }
+        args.extend([s("--mmproj"), s(LFM3_PROJECTOR)]);
     }
     args.extend([s("--device"), device]);
     Ok(args)
