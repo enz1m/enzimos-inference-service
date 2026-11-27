@@ -131,32 +131,48 @@ async fn health_does_not_load_and_streaming_applies_model_policy() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn prompt_cache_is_scoped_to_an_explicit_conversation() {
+async fn prompt_cache_shares_only_the_static_prefix_between_conversations() {
     let run = start(|_, _| {}).await;
-    for conversation in ["a", "a", "b"] {
-        send(
-            &run.socket,
-            post(
-                "/v1/chat/completions",
-                &json!({"messages": [], "conversation_id": conversation}),
-            ),
-        )
-        .await;
+    for (conversation, system, prompt) in [
+        (Some("a"), "shared guidance", "private A"),
+        (Some("a"), "shared guidance", "follow-up A"),
+        (Some("b"), "shared guidance", "private B"),
+        (Some("c"), "different guidance", "rejected by native"),
+        (Some("c"), "different guidance", "private C"),
+        (None, "different guidance", "unspecified conversation"),
+    ] {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        });
+        if let Some(id) = conversation {
+            body["conversation_id"] = json!(id);
+        }
+        send(&run.socket, post("/v1/chat/completions", &body)).await;
     }
-    send(
-        &run.socket,
-        post("/v1/chat/completions", &json!({"messages": []})),
-    )
-    .await;
-    let flags = logged(run._dir.path())
+    let requests = logged(run._dir.path());
+    let flags = requests
         .iter()
         .map(|b| b["cache_prompt"].as_bool().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(flags, [false, true, false, false]);
+    assert_eq!(flags, [false, true, true, true, false, false, false]);
+    let prefix = &requests[2];
+    assert_eq!(prefix["max_tokens"], 1);
+    assert_eq!(prefix["add_generation_prompt"], false);
+    assert_eq!(prefix["messages"][0], requests[1]["messages"][0]);
+    assert_eq!(
+        prefix["messages"][1],
+        json!({"role": "user", "content": ""})
+    );
+    assert_eq!(prefix["tools"], requests[1]["tools"]);
+    assert_eq!(requests[3]["messages"][1]["content"], "private B");
     assert!(
-        logged(run._dir.path())
+        requests
             .iter()
-            .all(|b| b.get("conversation_id").is_none())
+            .all(|body| body.get("conversation_id").is_none())
     );
 }
 

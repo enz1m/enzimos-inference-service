@@ -53,8 +53,46 @@ pub struct State {
 #[derive(Default)]
 pub struct Engine {
     child: Option<Child>,
-    cache_key: Option<(String, String)>,
+    cache_key: Option<CacheKey>,
     preloaded: bool,
+}
+
+struct CacheKey {
+    session: String,
+    prefix: Option<Value>,
+}
+
+fn static_prefix(path: &str, body: &Map<String, Value>) -> Option<Value> {
+    if path != "/v1/chat/completions" {
+        return None;
+    }
+    let messages = body.get("messages")?.as_array()?;
+    let system = messages.first()?;
+    if system["role"] != "system"
+        || !system["content"].is_string()
+        || messages.get(1)?["role"] != "user"
+        || !messages[1]["content"].is_string()
+    {
+        return None;
+    }
+    let mut prefix = json!({
+        "model": body["model"],
+        "messages": [
+            {"role": "system", "content": system["content"]},
+            {"role": "user", "content": ""},
+        ],
+        "chat_template_kwargs": body["chat_template_kwargs"],
+        "add_generation_prompt": false,
+        "cache_prompt": true,
+        "max_tokens": 1,
+        "stream": false,
+    });
+    for key in ["tools", "tool_choice"] {
+        if let Some(value) = body.get(key) {
+            prefix[key] = value.clone();
+        }
+    }
+    (prefix.to_string().len() <= 8192).then_some(prefix)
 }
 
 pub struct Supervisor {
@@ -395,7 +433,7 @@ impl Supervisor {
                     self.state.lock().unwrap().loaded = Some(model.into());
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
             }
             self.stop(engine).await;
         }
@@ -479,13 +517,31 @@ impl Supervisor {
         let mut abort = abort;
         abort.armed = false;
         engine.preloaded = false;
+        let key = match path {
+            "/tokenize" => None,
+            _ => session.map(|session| CacheKey {
+                session,
+                prefix: static_prefix(path, &body),
+            }),
+        };
         if path != "/tokenize" {
-            let reuse = session
-                .as_ref()
-                .is_some_and(|s| engine.cache_key == Some((model.clone(), s.clone())));
+            let mut reuse = false;
+            if let (Some(current), Some(previous)) = (&key, engine.cache_key.take()) {
+                if previous.session == current.session {
+                    reuse = true;
+                } else if let Some(prefix) = &current.prefix
+                    && previous.prefix.as_ref() == Some(prefix)
+                {
+                    // Replace the old slot's private tail before comparing it to a different chat.
+                    reuse = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        crate::calibrate::native_request(&self.engine_socket(), path, prefix),
+                    )
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                }
+            }
             body.insert("cache_prompt".into(), json!(reuse));
-            // Set again only when this request completes.
-            engine.cache_key = None;
         }
         let relay = async {
             let mut native = UnixStream::connect(self.engine_socket())
@@ -496,6 +552,8 @@ impl Supervisor {
                 .await
                 .map_err(|_| unavailable("runtime unavailable"))?;
             // Relay native HTTP framing and SSE incrementally.
+            const OK: &[u8] = b"HTTP/1.1 200 ";
+            let mut status = Vec::with_capacity(OK.len());
             let mut total = 0usize;
             let mut chunk = vec![0u8; 65536];
             loop {
@@ -506,6 +564,8 @@ impl Supervisor {
                 if n == 0 {
                     break;
                 }
+                let prefix = n.min(OK.len() - status.len());
+                status.extend_from_slice(&chunk[..prefix]);
                 total += n;
                 if total > 4 * 1024 * 1024 {
                     return Err(unavailable("runtime response exceeds limit"));
@@ -522,13 +582,13 @@ impl Supervisor {
                     failure.unwrap_or_else(|| "runtime exited before response".into()),
                 ));
             }
-            Ok(())
+            Ok(status == OK)
         }
         .await;
         match relay {
-            Ok(()) => {
-                if path != "/tokenize" {
-                    engine.cache_key = session.map(|s| (model, s));
+            Ok(accepted) => {
+                if accepted && path != "/tokenize" {
+                    engine.cache_key = key;
                 }
                 Ok(None)
             }

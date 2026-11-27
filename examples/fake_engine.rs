@@ -54,11 +54,11 @@ fn main() {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}");
             continue;
         }
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or_default();
         if let Some(log) = &log {
-            let body = text
-                .split_once("\r\n\r\n")
-                .map(|(_, b)| b)
-                .unwrap_or_default();
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -67,6 +67,15 @@ fn main() {
             let _ = writeln!(file, "{body}");
         }
         std::thread::sleep(std::time::Duration::from_millis(delay));
+        let request = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+        if request["messages"][1]["content"] == "rejected by native" {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}");
+            continue;
+        }
+        if request["add_generation_prompt"] == false {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+            continue;
+        }
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"content\":\"one\"}\n\n");
         let _ = stream.write_all(b"data: {\"content\":\"two\"}\n\n");
     }

@@ -156,7 +156,7 @@ pub fn cpu_budget_with(
 ) -> Vec<u32> {
     let mut available = available.to_vec();
     available.sort();
-    let wanted = requested.unwrap_or(available.len() as u64 / 4) as usize;
+    let wanted = requested.unwrap_or(2) as usize;
     let count = wanted.min(2).min(available.len()).max(1);
     let mut chosen = Vec::new();
     let mut seen = BTreeSet::new();
@@ -683,6 +683,7 @@ pub(crate) mod tests {
             [13, 15]
         );
         assert_eq!(cpu_budget_with(&[0, 1], None, &core), [1]);
+        assert_eq!(cpu_budget_with(&[0, 2], None, &core), [0, 2]);
         assert_eq!(
             cpu_budget_with(&(0..16).collect::<Vec<_>>(), Some(1), &core),
             [15]

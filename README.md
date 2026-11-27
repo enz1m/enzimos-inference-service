@@ -107,9 +107,11 @@ preserved. The units use the user manager's XDG configuration directory.
 The default context of 4,608 tokens leaves room for a 4,096-token input and 512
 output tokens. The runtime uses one slot, a batch of 256 and a microbatch of
 128. The cache format can vary with the selected model and backend.
-Conversation-scoped `conversation_id` permits in-memory prefix reuse only on
-consecutive requests to the same model/session; unrelated requests reset it.
-No session transcript or disk prompt cache is written.
+An explicit `conversation_id` enables in-memory reuse between consecutive
+requests in one conversation. When two chats have the same system prompt and
+tool definitions, the runtime can reuse their shared prefix after replacing the
+previous chat's private tokens with an empty user message. The service keeps
+one runtime slot and writes no session transcript or disk prompt cache.
 
 The default inference memory budget is 1,900 MiB. The user unit also sets
 `MemoryHigh=2400M`, `MemoryMax=2688M`, `MemorySwapMax=0`, `CPUQuota=200%`,
