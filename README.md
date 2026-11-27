@@ -159,6 +159,16 @@ the scope memory peak and sampled native-plus-supervisor RSS. GPU profiling rema
 unqualified without independent driver/correctness accounting. The CPU correctness
 flag is a native response/full-context smoke gate, not semantic model quality.
 
+## Model warm-up
+
+`POST /v1/models/warmup` accepts a registered text model ID in `model`.
+The supervisor can skip a warm-up when a model is resident, a job is active,
+or available RAM is below the configured model budget plus 768 MiB.
+Successful warm-up returns `{"warmed":true,"model":"…"}` and performs no
+generation. A preload expires after at most 30 idle seconds. After a real
+request, the configured idle limit applies. Either idle worker can be released
+sooner when available RAM falls below 768 MiB.
+
 ## Typed preference control
 
 `GET /v1/preferences` returns schema1, a content-derived `revision`, `persistent`

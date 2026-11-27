@@ -573,7 +573,14 @@ pub fn check_request(
     body: &mut Map<String, Value>,
     config: &Value,
 ) -> Result<String, String> {
-    if !["/v1/chat/completions", "/completion", "/tokenize"].contains(&path) {
+    if ![
+        "/v1/chat/completions",
+        "/completion",
+        "/tokenize",
+        "/v1/models/warmup",
+    ]
+    .contains(&path)
+    {
         return Err("unsupported endpoint".into());
     }
     let model = body
@@ -585,7 +592,7 @@ pub fn check_request(
         .filter(|m| config["models"].get(*m).is_some() && kind(config, m) == "llm")
         .ok_or("unknown text model")?
         .to_owned();
-    if path != "/tokenize" {
+    if !matches!(path, "/tokenize" | "/v1/models/warmup") {
         if path == "/v1/chat/completions" && body.contains_key("n_predict") {
             return Err("native output override is reserved".into());
         }

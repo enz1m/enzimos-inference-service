@@ -54,6 +54,7 @@ pub struct State {
 pub struct Engine {
     child: Option<Child>,
     cache_key: Option<(String, String)>,
+    preloaded: bool,
 }
 
 pub struct Supervisor {
@@ -65,6 +66,17 @@ pub struct Supervisor {
     uid: u32,
     /// Wakes the monitor as soon as a worker starts.
     started: tokio::sync::Notify,
+}
+
+const IDLE_MEMORY_RESERVE_MIB: f64 = 768.0;
+const PRELOAD_IDLE_SECONDS: u64 = 30;
+
+fn available_memory_mib() -> Option<f64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    Some(kib.split_whitespace().next()?.parse::<f64>().ok()? / 1024.0)
 }
 
 const PREFERENCE_KEYS: [&str; 6] = [
@@ -223,6 +235,7 @@ impl Supervisor {
     pub async fn stop(&self, engine: &mut Engine) {
         let child = engine.child.take();
         engine.cache_key = None;
+        engine.preloaded = false;
         {
             let mut state = self.state.lock().unwrap();
             state.pid = None;
@@ -401,6 +414,41 @@ impl Supervisor {
         Ok(Job(self))
     }
 
+    async fn warmup(&self, mut body: Map<String, Value>) -> Result<Option<(u16, Value)>, Failure> {
+        if body.keys().any(|key| key != "model") {
+            return Err(bad("warm-up accepts only a model ID"));
+        }
+        let skipped = Ok(Some((200, json!({"warmed": false}))));
+        let Ok(mut engine) = self.engine.try_lock() else {
+            return skipped;
+        };
+        let config = {
+            let state = self.state.lock().unwrap();
+            // Speculative work must not evict an active model or its conversation cache.
+            if state.jobs != 0 || state.loaded.is_some() {
+                return skipped;
+            }
+            state.config.clone()
+        };
+        let model = check_request("/v1/models/warmup", &mut body, &config).map_err(bad)?;
+        if !available_memory_mib().is_some_and(|available| {
+            available >= policy::memory_mib(&config) + IDLE_MEMORY_RESERVE_MIB
+        }) {
+            return skipped;
+        }
+        let Ok(_job) = self.admit() else {
+            return skipped;
+        };
+        let mut abort = Abort {
+            supervisor: self,
+            armed: true,
+        };
+        self.start(&mut engine, &model).await?;
+        abort.armed = false;
+        engine.preloaded = true;
+        Ok(Some((200, json!({"warmed": true, "model": model}))))
+    }
+
     pub async fn proxy(
         &self,
         path: &str,
@@ -430,6 +478,7 @@ impl Supervisor {
         self.start(&mut engine, &model).await?;
         let mut abort = abort;
         abort.armed = false;
+        engine.preloaded = false;
         if path != "/tokenize" {
             let reuse = session
                 .as_ref()
@@ -619,7 +668,7 @@ impl Supervisor {
                 continue;
             };
             let (rss, driver) = (rss_mib(pid), driver_ram_mib(pid));
-            let (over, idle) = {
+            let (over, idle_seconds) = {
                 let mut s = self.state.lock().unwrap();
                 s.peak_rss_mib = s.peak_rss_mib.max(rss);
                 s.peak_driver_ram_mib = s.peak_driver_ram_mib.max(driver);
@@ -628,12 +677,7 @@ impl Supervisor {
                 if over {
                     s.failure = Some("model exceeded the configured RAM budget".into());
                 }
-                (
-                    over,
-                    s.jobs == 0
-                        && s.last_used.elapsed()
-                            > Duration::from_secs(policy::get_u64(&s.config, "idle_seconds", 60)),
-                )
+                (over, policy::get_u64(&s.config, "idle_seconds", 60))
             };
             if over {
                 self.kill_worker();
@@ -641,11 +685,22 @@ impl Supervisor {
                 if let Ok(mut engine) = self.engine.try_lock() {
                     self.stop(&mut engine).await;
                 }
-            } else if idle
-                && let Ok(mut engine) = self.engine.try_lock()
-                && self.state.lock().unwrap().jobs == 0
-            {
-                self.stop(&mut engine).await;
+            } else if let Ok(mut engine) = self.engine.try_lock() {
+                let idle_limit = if engine.preloaded {
+                    idle_seconds.min(PRELOAD_IDLE_SECONDS)
+                } else {
+                    idle_seconds
+                };
+                let should_stop = {
+                    let state = self.state.lock().unwrap();
+                    state.jobs == 0
+                        && (state.last_used.elapsed() > Duration::from_secs(idle_limit)
+                            || available_memory_mib()
+                                .is_some_and(|mib| mib < IDLE_MEMORY_RESERVE_MIB))
+                };
+                if should_stop {
+                    self.stop(&mut engine).await;
+                }
             }
         }
     }
@@ -785,7 +840,7 @@ impl Supervisor {
         if request.method != "POST" {
             return Err(bad("unsupported request"));
         }
-        let limit = if path == "/v1/preferences" {
+        let limit = if matches!(path, "/v1/preferences" | "/v1/models/warmup") {
             4096
         } else {
             3 * 1024 * 1024
@@ -805,10 +860,10 @@ impl Supervisor {
         }
         // The caller disconnecting cancels the job; Abort and Job guards clean up.
         let operation = async {
-            if path == "/v1/audio/transcriptions" {
-                self.transcribe(body).await
-            } else {
-                self.proxy(path, body, writer, started).await
+            match path {
+                "/v1/audio/transcriptions" => self.transcribe(body).await,
+                "/v1/models/warmup" => self.warmup(body).await,
+                _ => self.proxy(path, body, writer, started).await,
             }
         };
         tokio::select! {

@@ -106,6 +106,13 @@ async fn health_does_not_load_and_streaming_applies_model_policy() {
         (Some(256), Some(false), Some("m"))
     );
     assert_eq!(status(&run.socket).await["loaded_model"], "m");
+    let prefetch = send(
+        &run.socket,
+        post("/v1/models/warmup", &json!({"model": "m"})),
+    )
+    .await;
+    assert!(prefetch.contains("\"warmed\":false"), "{prefetch}");
+    assert_eq!(logged(run._dir.path()).len(), 1);
     let refused = send(
         &run.socket,
         post(
