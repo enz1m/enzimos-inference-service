@@ -68,7 +68,7 @@ parent and its files are protected. Folder models need the sherpa-onnx runtime
 
 `fetch ID` downloads an explicit choice from the [built-in catalog](src/models/catalog.rs)
 over HTTPS and verifies its pinned SHA-256 before importing it. The catalog
-offers LFM3-VL-2B for text, Qwen3.5 0.8B, Parakeet TDT and Moonshine. LFM3
+offers LFM3-VL-2B for text, MiniCPM5 1B, Parakeet TDT and Moonshine. LFM3
 requires a CPU runtime that declares support for its architecture. Downloads
 use private scratch space on the same filesystem as the model store.
 

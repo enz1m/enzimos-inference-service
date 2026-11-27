@@ -791,6 +791,8 @@ mod tests {
         let runtimes = dir.join("runtimes");
         std::fs::create_dir_all(runtimes.join("cpu")).unwrap();
         std::fs::write(runtimes.join("cpu/llama-server"), b"#!").unwrap();
+        let lfm = dir.join("lfm.gguf");
+        gguf_file(&lfm, "LFM3-VL-2B", "lfm3");
         let model = dir.join("text.gguf");
         gguf_file(&model, "MiniCPM5", "minicpm");
         let speech = dir.join("speech.bin");
@@ -798,10 +800,11 @@ mod tests {
         let owner = std::fs::metadata(dir).unwrap().uid();
         let registry = dir.join("config/inference.json");
         let manifest = dir.join("models.tsv");
+        let lfm_digest = policy::file_sha256(&lfm).unwrap();
         let text_digest = policy::file_sha256(&model).unwrap();
         let rows = |speech_digest| {
             format!(
-                "text\ttext.gguf\t{text_digest}\tyes\nspeech\tspeech.bin\t{speech_digest}\tyes\n"
+                "lfm3-vl-2b\tlfm.gguf\t{lfm_digest}\tyes\nminicpm5-1b\ttext.gguf\t{text_digest}\tno\nspeech\tspeech.bin\t{speech_digest}\tyes\n"
             )
         };
         std::fs::write(&manifest, rows("wrong-digest")).unwrap();
@@ -811,7 +814,8 @@ mod tests {
         std::fs::write(&manifest, rows(&speech_digest)).unwrap();
         seed_registry(&registry, dir, &runtimes, owner).unwrap();
         let mut saved: Value = serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
-        assert_eq!(saved["default_model"], "text");
+        assert_eq!(saved["default_model"], "lfm3-vl-2b");
+        assert_eq!(saved["models"]["minicpm5-1b"]["kind"], "llm");
         assert_eq!(saved["default_speech_model"], "speech");
         assert_eq!(std::fs::metadata(&registry).unwrap().mode() & 0o777, 0o600);
         saved["default_speech_model"] = Value::Null;

@@ -79,13 +79,13 @@ pub const CATALOG: [Offer; 4] = [
         required_architecture: Some("lfm3"),
     },
     Offer {
-        id: "qwen3.5-0.8b",
-        title: "Qwen3.5 0.8B",
+        id: "minicpm5-1b",
+        title: "MiniCPM5 1B",
         description: "Smaller text model for low-memory computers",
         format: Format::Text,
-        url: "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf",
-        sha256: "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
-        bytes: 532_517_120,
+        url: "https://huggingface.co/openbmb/MiniCPM5-1B-GGUF/resolve/5385560dd3e232bcc3577fd9442c332cad2facbd/MiniCPM5-1B-Q4_K_M.gguf",
+        sha256: "81b64d05a23b17b34c475f42b3e72fbde62d4b92cc34541f7a8031d0752deafa",
+        bytes: 688_065_920,
         required_architecture: None,
     },
     Offer {
