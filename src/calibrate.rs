@@ -232,7 +232,7 @@ pub fn qualified_row(
     Ok(
         json!({"backend": "cpu", "hardware_sha256": policy::fingerprint(hw), "model_sha256": config["models"][model]["sha256"],
         "runtime_revision": runtime["revision"], "runtime_artifact_sha256": runtime.get("artifact_sha256").cloned().unwrap_or(Value::Null), "runtime_server_sha256": server,
-        "context": policy::context(config), "threads": hw["worker_cpus"].as_array().map_or(0, Vec::len),
+        "context": policy::context_for_model(config, model), "threads": hw["worker_cpus"].as_array().map_or(0, Vec::len),
         "cache_type": options.get("cache_type").cloned().unwrap_or(json!("q8_0")), "repack": options.get("repack").cloned().unwrap_or(json!(true)),
         "correctness_pass": true, "correctness_scope": "CPU native response/full 4096-token input; not semantic model quality",
         "peak_total_mib": peak, "estimated_request_seconds": score,
@@ -259,7 +259,7 @@ pub async fn calibrate(config: &Value, model: &str, group: &Path) -> Result<Valu
     if config["models"].get(model).is_none() || policy::kind(config, model) != "llm" {
         return Err("registered text model required".into());
     }
-    if policy::context(config) < 4128 {
+    if policy::context_for_model(config, model) < 4128 {
         return Err("4k prompt plus output headroom required".into());
     }
     let runtime = &config["runtimes"]["cpu"];

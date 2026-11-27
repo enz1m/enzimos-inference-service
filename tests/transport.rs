@@ -177,6 +177,38 @@ async fn prompt_cache_shares_only_the_static_prefix_between_conversations() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn idle_warmup_seeds_only_the_static_prefix() {
+    let run = start(|_, _| {}).await;
+    let system = json!({"role":"system","content":"Shared guidance"});
+    let tools = json!([{"type":"function","function":{"name":"lookup"}}]);
+    let template = json!({"enable_thinking":false});
+    let warm = send(
+        &run.socket,
+        post(
+            "/v1/models/warmup",
+            &json!({"model":"m","prefix":{
+                "messages":[system, {"role":"user","content":""}],
+                "tools":tools,
+                "chat_template_kwargs":template
+            }}),
+        ),
+    )
+    .await;
+    assert!(warm.contains("\"prefix_cached\":true"), "{warm}");
+    let before = logged(run._dir.path());
+    assert_eq!(before.len(), 1, "startup requested one prefill");
+    assert_eq!(before[0]["messages"][1]["content"], "");
+    let reply = send(&run.socket, post("/v1/chat/completions", &json!({
+        "conversation_id":"one","messages":[system,{"role":"user","content":"private input"}],
+        "tools":tools,"chat_template_kwargs":template
+    }))).await;
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    let requests = logged(run._dir.path());
+    assert_eq!(requests.len(), 2, "first turn reused the idle prefill");
+    assert_eq!(requests[1]["cache_prompt"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn disconnect_releases_the_job_and_keeps_the_model_loaded() {
     let run =
         start(|c, _| c["runtimes"]["cpu"]["environment"]["FAKE_DELAY_MS"] = json!("3000")).await;

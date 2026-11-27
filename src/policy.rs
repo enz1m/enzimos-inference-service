@@ -10,7 +10,20 @@ pub fn get_u64(config: &Value, key: &str, default: u64) -> u64 {
     config.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 pub fn context(config: &Value) -> u64 {
-    get_u64(config, "context", 4608)
+    context_for_model(config, config["default_model"].as_str().unwrap_or_default())
+}
+
+pub(crate) fn context_for_model(config: &Value, model: &str) -> u64 {
+    if let Some(explicit) = config["context"].as_u64() {
+        return explicit;
+    }
+    let budget = memory_mib(config);
+    match (config["models"][model]["architecture"].as_str(), model) {
+        (Some("lfm3"), _) | (_, "lfm3-vl-2b") if budget >= 1900.0 => 8192,
+        (Some("minicpm"), _) | (_, "minicpm5-1b") if budget >= 1900.0 => 8192,
+        _ if budget >= 1900.0 => 6144,
+        _ => 4608,
+    }
 }
 pub fn memory_mib(config: &Value) -> f64 {
     config
@@ -248,7 +261,11 @@ pub fn validate(config: &Value, verify: bool) -> Result<(), String> {
     if config.get("schema") != Some(&json!(1)) {
         return Err("unsupported configuration schema".into());
     }
-    if !(4096..=8192).contains(&context(config)) {
+    if !config["context"].is_null()
+        && !config["context"]
+            .as_u64()
+            .is_some_and(|value| (4096..=8192).contains(&value))
+    {
         return Err("context outside supported policy".into());
     }
     if !(1..=3600).contains(&get_u64(config, "idle_seconds", 60)) {
@@ -381,7 +398,7 @@ pub fn calibrated(
         {
             continue;
         }
-        if row["context"] != context(config)
+        if row["context"] != context_for_model(config, model)
             || row["threads"] != hw["worker_cpus"].as_array().map_or(0, Vec::len)
         {
             continue;
@@ -483,7 +500,7 @@ pub fn server_command(
         s("--host"),
         socket.to_string_lossy().into_owned(),
         s("--ctx-size"),
-        context(config).to_string(),
+        context_for_model(config, model).to_string(),
         s("--parallel"),
         s("1"),
         s("--threads"),
@@ -646,6 +663,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn automatic_context_uses_model_and_budget_until_explicitly_overridden() {
+        let mut config = json!({"memory_mib":1900, "models": {
+            "lfm":{"architecture":"lfm3"},
+            "other":{"architecture":"llama"}
+        }});
+        assert_eq!(
+            context_for_model(&config, "lfm"),
+            8192,
+            "known fitting model"
+        );
+        assert_eq!(
+            context_for_model(&config, "other"),
+            6144,
+            "conservative default"
+        );
+        config["memory_mib"] = json!(1024);
+        assert_eq!(context_for_model(&config, "lfm"), 4608, "smaller budget");
+        config["context"] = json!(5120);
+        assert_eq!(
+            context_for_model(&config, "lfm"),
+            5120,
+            "explicit preference"
+        );
+    }
+
+    #[test]
     fn digest_tampering_and_bad_paths_refused() {
         let dir = tempfile::tempdir().unwrap();
         let config = fixture(dir.path());
@@ -763,7 +806,7 @@ pub(crate) mod tests {
         config["runtimes"]["vulkan"] = json!({"server": config["runtimes"]["cpu"]["server"], "revision": "v1", "device": "Vulkan0"});
         let hw = json!({"cpu_model": "x", "worker_cpus": [2, 3]});
         let row = json!({"backend": "vulkan", "hardware_sha256": fingerprint(&hw), "model_sha256": config["models"]["m"]["sha256"], "runtime_revision": "v1",
-            "context": 4608, "threads": 2, "correctness_pass": true, "peak_total_mib": 1500, "estimated_request_seconds": 4.0});
+            "context": context(&config), "threads": 2, "correctness_pass": true, "peak_total_mib": 1500, "estimated_request_seconds": 4.0});
         config["calibration"] = json!([row]);
         assert_eq!(
             execution_plan(&config, "m", &hw).unwrap()["backend"],

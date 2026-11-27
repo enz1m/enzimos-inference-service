@@ -58,7 +58,7 @@ pub struct Engine {
 }
 
 struct CacheKey {
-    session: String,
+    session: Option<String>,
     prefix: Option<Value>,
 }
 
@@ -126,6 +126,8 @@ const PREFERENCE_KEYS: [&str; 6] = [
     "default_model",
 ];
 
+mod power_boost;
+use power_boost::Boost;
 mod process;
 use process::{driver_ram_mib, rss_mib, spawn};
 mod benchmark;
@@ -178,7 +180,7 @@ impl Supervisor {
         policy::validate(&config, true)?;
         let base = config.clone();
         let defaults = json!({"cpu_threads": config.get("cpu_threads").cloned().unwrap_or(Value::Null), "memory_mib": config.get("memory_mib").cloned().unwrap_or(json!(1900)),
-            "idle_seconds": config.get("idle_seconds").cloned().unwrap_or(json!(60)), "context": config.get("context").cloned().unwrap_or(json!(4608)),
+            "idle_seconds": config.get("idle_seconds").cloned().unwrap_or_else(|| json!(60)), "context": config["context"].clone(),
             "backend": config.get("backend").cloned().unwrap_or(json!("auto")), "default_model": config["default_model"]});
         let checked = config.clone();
         let validate: preferences::Validate = Box::new(move |value| {
@@ -192,17 +194,20 @@ impl Supervisor {
             {
                 return Err("CPU threads must be1 or2 or null".into());
             }
-            for (key, low, high) in [
-                ("memory_mib", 256, 2048),
-                ("idle_seconds", 1, 3600),
-                ("context", 4096, 8192),
-            ] {
+            for (key, low, high) in [("memory_mib", 256, 2048), ("idle_seconds", 1, 3600)] {
                 if !value[key]
                     .as_u64()
                     .is_some_and(|v| value[key].is_u64() && (low..=high).contains(&v))
                 {
                     return Err("resource preference outside supported policy".into());
                 }
+            }
+            if !value["context"].is_null()
+                && !value["context"]
+                    .as_u64()
+                    .is_some_and(|value| (4096..=8192).contains(&value))
+            {
+                return Err("context outside supported policy".into());
             }
             let backend = value["backend"].as_str().unwrap_or_default();
             if backend != "auto" && checked["runtimes"].get(backend).is_none() {
@@ -454,9 +459,13 @@ impl Supervisor {
     }
 
     async fn warmup(&self, mut body: Map<String, Value>) -> Result<Option<(u16, Value)>, Failure> {
-        if body.keys().any(|key| key != "model") {
-            return Err(bad("warm-up accepts only a model ID"));
+        if body
+            .keys()
+            .any(|key| !matches!(key.as_str(), "model" | "prefix"))
+        {
+            return Err(bad("invalid warm-up request"));
         }
+        let seed = body.remove("prefix");
         let skipped = Ok(Some((200, json!({"warmed": false}))));
         let Ok(mut engine) = self.engine.try_lock() else {
             return skipped;
@@ -464,12 +473,35 @@ impl Supervisor {
         let config = {
             let state = self.state.lock().unwrap();
             // Speculative work must not evict an active model or its conversation cache.
-            if state.jobs != 0 || state.loaded.is_some() {
+            if state.jobs != 0 {
                 return skipped;
             }
             state.config.clone()
         };
         let model = check_request("/v1/models/warmup", &mut body, &config).map_err(bad)?;
+        let loaded = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .loaded
+            .clone();
+        if loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded != &model || seed.is_none())
+            || engine.cache_key.is_some()
+        {
+            return skipped;
+        }
+        let prefix = if let Some(Value::Object(mut seed)) = seed {
+            seed.insert("model".into(), json!(model));
+            static_prefix("/v1/chat/completions", &seed).filter(|_| {
+                seed["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.len() == 2 && messages[1]["content"] == "")
+            })
+        } else {
+            None
+        };
         if !available_memory_mib().is_some_and(|available| {
             available >= policy::memory_mib(&config) + IDLE_MEMORY_RESERVE_MIB
         }) {
@@ -484,8 +516,33 @@ impl Supervisor {
         };
         self.start(&mut engine, &model).await?;
         abort.armed = false;
-        engine.preloaded = true;
-        Ok(Some((200, json!({"warmed": true, "model": model}))))
+        let prefix_requested = prefix.is_some();
+        let mut prefetched = false;
+        if let Some(prefix) = prefix {
+            let _boost = Boost::while_processing();
+            prefetched = tokio::time::timeout(
+                Duration::from_secs(15),
+                crate::calibrate::native_request(
+                    &self.engine_socket(),
+                    "/v1/chat/completions",
+                    &prefix,
+                ),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok());
+            if prefetched {
+                engine.cache_key = Some(CacheKey {
+                    session: None,
+                    prefix: Some(prefix),
+                });
+            }
+        }
+        engine.preloaded = loaded.is_none() || engine.preloaded;
+        let mut result = json!({"warmed": true, "model": model});
+        if prefix_requested {
+            result["prefix_cached"] = json!(prefetched);
+        }
+        Ok(Some((200, result)))
     }
 
     pub async fn proxy(
@@ -521,10 +578,11 @@ impl Supervisor {
         let key = match path {
             "/tokenize" => None,
             _ => session.map(|session| CacheKey {
-                session,
+                session: Some(session),
                 prefix: static_prefix(path, &body),
             }),
         };
+        let _boost = (path != "/tokenize").then(Boost::while_processing);
         if path != "/tokenize" {
             let mut reuse = false;
             if let (Some(current), Some(previous)) = (&key, engine.cache_key.take()) {
@@ -534,12 +592,13 @@ impl Supervisor {
                     && previous.prefix.as_ref() == Some(prefix)
                 {
                     // Replace the old slot's private tail before comparing it to a different chat.
-                    reuse = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        crate::calibrate::native_request(&self.engine_socket(), path, prefix),
-                    )
-                    .await
-                    .is_ok_and(|result| result.is_ok());
+                    reuse = previous.session.is_none()
+                        || tokio::time::timeout(
+                            Duration::from_secs(2),
+                            crate::calibrate::native_request(&self.engine_socket(), path, prefix),
+                        )
+                        .await
+                        .is_ok_and(|result| result.is_ok());
                 }
             }
             body.insert("cache_prompt".into(), json!(reuse));
@@ -586,6 +645,7 @@ impl Supervisor {
             Ok(status == OK)
         }
         .await;
+        drop(_boost);
         match relay {
             Ok(accepted) => {
                 if accepted && path != "/tokenize" {
@@ -902,6 +962,9 @@ impl Supervisor {
                     // and the speech model the user chose for dictation.
                     let data = config["models"].as_object().into_iter().flatten().map(|(id, m)| {
                         let mut entry = json!({"id": id, "object": "model", "kind": m.get("kind").cloned().unwrap_or_else(|| json!("llm"))});
+                        if entry["kind"] == "llm" {
+                            entry["context"] = json!(policy::context_for_model(&config, id));
+                        }
                         if let Some(title) = m.get("title").filter(|title| title.is_string()) {
                             entry["title"] = title.clone();
                         }
@@ -921,11 +984,10 @@ impl Supervisor {
         if request.method != "POST" {
             return Err(bad("unsupported request"));
         }
-        let limit = if matches!(
-            path,
-            "/v1/preferences" | "/v1/models/warmup" | "/v1/models/benchmark"
-        ) {
+        let limit = if matches!(path, "/v1/preferences" | "/v1/models/benchmark") {
             4096
+        } else if path == "/v1/models/warmup" {
+            8192
         } else {
             3 * 1024 * 1024
         };
