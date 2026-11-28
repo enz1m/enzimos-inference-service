@@ -7,7 +7,11 @@ use super::*;
     unsafe_code,
     reason = "Linux syscall ABI (CPU_SET, getppid, nice, prctl and others)."
 )]
-fn harden(cpus: Vec<u32>, parent: i32) -> impl FnMut() -> std::io::Result<()> {
+fn harden(
+    cpus: Vec<u32>,
+    parent: i32,
+    address_space: Option<u64>,
+) -> impl FnMut() -> std::io::Result<()> {
     move || unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         for cpu in &cpus {
@@ -23,6 +27,15 @@ fn harden(cpus: Vec<u32>, parent: i32) -> impl FnMut() -> std::io::Result<()> {
             rlim_max: 0,
         };
         libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        if let Some(bytes) = address_space {
+            let limit = libc::rlimit {
+                rlim_cur: bytes,
+                rlim_max: bytes,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
         // GPU drivers reserve large virtual ranges; RSS and cgroup limits enforce RAM.
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
         if libc::getppid() != parent {
@@ -40,6 +53,7 @@ pub(super) fn spawn(
     cpus: Vec<u32>,
     output: Option<&Path>,
     capture_errors: bool,
+    address_space: Option<u64>,
 ) -> std::io::Result<Child> {
     let stdout = match output {
         Some(path) => {
@@ -67,7 +81,7 @@ pub(super) fn spawn(
             Stdio::null()
         })
         .kill_on_drop(true);
-    unsafe { command.pre_exec(harden(cpus, libc::getpid())) };
+    unsafe { command.pre_exec(harden(cpus, libc::getpid(), address_space)) };
     command.spawn()
 }
 

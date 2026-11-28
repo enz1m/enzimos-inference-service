@@ -7,7 +7,7 @@ credentials belong to the separate `enzimos-ai-gateway` repository.
 
 Rust binaries: `enzimos-inference` (service), `enzimos-inference-calibrate`,
 `enzimos-inference-models` (the account's model registry) and `enzimos-inference-probe`. Private mode-0600 Unix HTTP socket,
-verified model registry, lazy loading, one native worker, two admitted jobs maximum (one active, one waiting),
+verified model registry, lazy loading, one text worker, a bounded voice-recognition lane and two admitted jobs maximum,
 streaming relay, disconnect cancellation, CPU affinity/priority, idle unloading,
 RAM monitoring, GPU startup fallback and CPU/Vulkan/SYCL/CUDA runtime slots.
 Automatic selection uses exact model/runtime/hardware/context calibration receipts;
@@ -101,6 +101,17 @@ preserved. The units use the user manager's XDG configuration directory.
   other codes are refused) and Moonshine (English only; another language code is
   refused). Same limits, timeout, confinement and removal of temporary data for both.
   This is not the cloud multipart transcription API and is not transparently routed.
+- `POST /v1/audio/voice-transcriptions` takes the same WAV and language fields,
+  plus a required Boolean `directed`. Voice accepts up to 12 seconds and one
+  speech request at a time. Parallel admission requires a Whisper file up to
+  96 MiB, two distinct allowed cores, a 768 MiB address-space allowance and
+  available host and cgroup memory for the desktop and possible text-worker
+  growth. It leaves the loaded text worker and prompt cache resident. An
+  explicit mic gesture can use the serial path when parallel admission is
+  unavailable. Background recognition returns 503 under those conditions.
+  `GET /status` reports the active parallel worker separately. The model
+  list marks fitting Whisper weights with `voice_parallel: true`. The
+  Assistant can prefer those weights independently of the dictation default.
 - Unsupported runtime controls and model paths are rejected. MCP tool execution is
   separate and remains subject to the central broker’s consent and capabilities.
 
@@ -114,7 +125,7 @@ previous chat's private tokens with an empty user message. The service keeps
 one runtime slot and writes no session transcript or disk prompt cache.
 
 The default inference memory budget is 1,900 MiB. The user unit also sets
-`MemoryHigh=2400M`, `MemoryMax=2688M`, `MemorySwapMax=0`, `CPUQuota=200%`,
+`MemoryHigh=2400M`, `MemoryMax=3G`, `MemorySwapMax=0`, `CPUQuota=200%`,
 `CPUWeight=20` and `Nice=15`. Workers use at most two threads. GPU allocations need separate driver accounting and installed cgroup tests;
 RSS alone is not a total-memory guarantee. Unqualified GPU calibration is refused.
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-use super::{Abort, Failure, Supervisor, bad, driver_ram_mib, rss_mib, unavailable};
+use super::{Abort, Failure, SpeechMode, Supervisor, bad, driver_ram_mib, rss_mib, unavailable};
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use std::{future::Future, time::Duration};
@@ -35,7 +35,7 @@ impl Supervisor {
                         ("language".into(), json!("en")),
                         ("wav_base64".into(), json!(sample)),
                     ]),
-                    true,
+                    SpeechMode::Benchmark,
                 )
                 .await;
         }

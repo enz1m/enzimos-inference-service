@@ -1,0 +1,125 @@
+diff --git a/sherpa-onnx/c-api/c-api.cc b/sherpa-onnx/c-api/c-api.cc
+index 67f0ddb..6d76941 100644
+--- a/sherpa-onnx/c-api/c-api.cc
++++ b/sherpa-onnx/c-api/c-api.cc
+@@ -367,6 +367,15 @@ void SherpaOnnxDestroyOnlineRecognizerResult(
+   }
+ }
+ 
++const char *SherpaOnnxGetOnlineStreamAlternativesAsJson(
++    const SherpaOnnxOnlineRecognizer *recognizer,
++    const SherpaOnnxOnlineStream *stream) {
++  if (!recognizer || !stream) return nullptr;
++  auto alternatives = recognizer->impl->GetAlternatives(stream->impl.get());
++  return CopyString(nlohmann::json(alternatives).dump(
++      -1, ' ', false, nlohmann::json::error_handler_t::replace));
++}
++
+ const char *SherpaOnnxGetOnlineStreamResultAsJson(
+     const SherpaOnnxOnlineRecognizer *recognizer,
+     const SherpaOnnxOnlineStream *stream) {
+diff --git a/sherpa-onnx/c-api/c-api.h b/sherpa-onnx/c-api/c-api.h
+index 724e678..7bdb236 100644
+--- a/sherpa-onnx/c-api/c-api.h
++++ b/sherpa-onnx/c-api/c-api.h
+@@ -688,6 +688,13 @@ SHERPA_ONNX_API void SherpaOnnxDestroyOnlineRecognizerResult(
+  * SherpaOnnxDestroyOnlineStreamResultJson(json);
+  * @endcode
+  */
++/** Returns up to eight final [text, normalized score] pairs for beam search.
++ *  Release the returned string with SherpaOnnxDestroyOnlineStreamResultJson.
++ */
++SHERPA_ONNX_API const char *SherpaOnnxGetOnlineStreamAlternativesAsJson(
++    const SherpaOnnxOnlineRecognizer *recognizer,
++    const SherpaOnnxOnlineStream *stream);
++
+ SHERPA_ONNX_API const char *SherpaOnnxGetOnlineStreamResultAsJson(
+     const SherpaOnnxOnlineRecognizer *recognizer,
+     const SherpaOnnxOnlineStream *stream);
+diff --git a/sherpa-onnx/csrc/online-recognizer-impl.h b/sherpa-onnx/csrc/online-recognizer-impl.h
+index 9c2b4b7..aed4b87 100644
+--- a/sherpa-onnx/csrc/online-recognizer-impl.h
++++ b/sherpa-onnx/csrc/online-recognizer-impl.h
+@@ -53,6 +53,11 @@ class OnlineRecognizerImpl {
+ 
+   virtual OnlineRecognizerResult GetResult(OnlineStream *s) const = 0;
+ 
++  virtual std::vector<std::pair<std::string, double>> GetAlternatives(
++      OnlineStream *s) const {
++    return {};
++  }
++
+   virtual bool IsEndpoint(OnlineStream *s) const = 0;
+ 
+   virtual void Reset(OnlineStream *s) const = 0;
+diff --git a/sherpa-onnx/csrc/online-recognizer-transducer-impl.h b/sherpa-onnx/csrc/online-recognizer-transducer-impl.h
+index 1726de3..4ad8b6d 100644
+--- a/sherpa-onnx/csrc/online-recognizer-transducer-impl.h
++++ b/sherpa-onnx/csrc/online-recognizer-transducer-impl.h
+@@ -399,6 +399,25 @@ class OnlineRecognizerTransducerImpl : public OnlineRecognizerImpl {
+     return r;
+   }
+ 
++  std::vector<std::pair<std::string, double>> GetAlternatives(
++      OnlineStream *s) const override {
++    std::vector<std::pair<std::string, double>> results;
++    const auto &beam = s->GetResult().hyps;
++    const size_t context_size = model_->ContextSize();
++    for (const auto &hyp : beam.GetTopK(8, true)) {
++      if (hyp.ys.size() <= context_size) continue;
++      OnlineTransducerDecoderResult candidate;
++      candidate.tokens.assign(hyp.ys.begin() + context_size, hyp.ys.end());
++      auto result = Convert(candidate, sym_, 10, 4, 0, 0,
++                            s->GetOptionInt("remove_cjk_space", 1));
++      result.text = ApplyInverseTextNormalization(std::move(result.text));
++      result.text = ApplyHomophoneReplacer(std::move(result.text));
++      results.emplace_back(std::move(result.text),
++                           hyp.TotalLogProb() / hyp.ys.size());
++    }
++    return results;
++  }
++
+   bool IsEndpoint(OnlineStream *s) const override {
+     if (!config_.enable_endpoint) {
+       return false;
+diff --git a/sherpa-onnx/csrc/online-recognizer.cc b/sherpa-onnx/csrc/online-recognizer.cc
+index be9fbe3..351e0d6 100644
+--- a/sherpa-onnx/csrc/online-recognizer.cc
++++ b/sherpa-onnx/csrc/online-recognizer.cc
+@@ -259,6 +259,15 @@ OnlineRecognizerResult OnlineRecognizer::GetResult(OnlineStream *s) const {
+   return r;
+ }
+ 
++std::vector<std::pair<std::string, double>> OnlineRecognizer::GetAlternatives(
++    OnlineStream *s) const {
++  auto alternatives = impl_->GetAlternatives(s);
++  for (auto &entry : alternatives) {
++    entry.first = RemoveLeadingPunct(RemoveLeadingSpaces(entry.first));
++  }
++  return alternatives;
++}
++
+ void RemoveLeadingPunct(OnlineRecognizerResult *r) {
+   std::string text = RemoveLeadingPunct(r->text);
+   if (text.size() == r->text.size()) {
+diff --git a/sherpa-onnx/csrc/online-recognizer.h b/sherpa-onnx/csrc/online-recognizer.h
+index 7e54fc4..91dac20 100644
+--- a/sherpa-onnx/csrc/online-recognizer.h
++++ b/sherpa-onnx/csrc/online-recognizer.h
+@@ -7,6 +7,7 @@
+ 
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "sherpa-onnx/csrc/endpoint.h"
+@@ -229,6 +230,8 @@ class OnlineRecognizer {
+   void DecodeStreams(OnlineStream **ss, int32_t n) const;
+ 
+   OnlineRecognizerResult GetResult(OnlineStream *s) const;
++  std::vector<std::pair<std::string, double>> GetAlternatives(
++      OnlineStream *s) const;
+ 
+   // Return true if we detect an endpoint for this stream.
+   // Note: If this function returns true, you usually want to

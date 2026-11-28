@@ -380,6 +380,94 @@ async fn local_speech_is_bounded_and_transcribed() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn voice_lane_preserves_text_pid_cache_and_cleans_up_after_disconnect() {
+    use base64::Engine as _;
+    if enzimos_inference_service::policy::cpu_budget(Some(2)).len() < 2 {
+        return;
+    }
+    let run = start(|c, dir| {
+        let cli = dir.join("whisper-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexec /usr/bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let model = dir.join("speech.bin");
+        std::fs::write(&model, b"speech").unwrap();
+        c["models"]["voice"] = json!({"path": model, "kind": "speech", "sha256": enzimos_inference_service::policy::file_sha256(&model).unwrap()});
+        c["speech"] = json!({"cli": cli});
+        c["cpu_threads"] = json!(1);
+        c["runtimes"]["cpu"]["environment"]["FAKE_DELAY_MS"] = json!("2800");
+    }).await;
+    let chat = || {
+        post(
+            "/v1/chat/completions",
+            &json!({
+                "conversation_id":"one", "messages":[{"role":"user","content":"hello"}],
+            }),
+        )
+    };
+    assert!(send(&run.socket, chat()).await.starts_with("HTTP/1.1 200"));
+    let text_pid = run.supervisor.state.lock().unwrap().pid.unwrap();
+    let voice = || {
+        post(
+            "/v1/audio/voice-transcriptions",
+            &json!({
+                "model":"voice", "wav_base64":base64::engine::general_purpose::STANDARD.encode(wav(1, 16000, 1)),
+                "directed":false,
+            }),
+        )
+    };
+    let mut client = UnixStream::connect(&run.socket).await.unwrap();
+    client.write_all(voice().as_bytes()).await.unwrap();
+    let voice_pid = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let current = status(&run.socket).await;
+            if let Some(pid) = current["voice_worker"]["pid"].as_u64() {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let scratch = || {
+        std::fs::read_dir(run.socket.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("speech-"))
+    };
+    assert!(scratch());
+    assert_ne!(u64::from(text_pid), voice_pid);
+    let refusal = send(&run.socket, voice()).await;
+    assert!(
+        refusal.starts_with("HTTP/1.1 429") && refusal.contains("recognition busy"),
+        "{refusal}"
+    );
+    let socket = run.socket.clone();
+    let body = chat();
+    let chat = tokio::spawn(async move { send(&socket, body).await });
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let s = status(&run.socket).await;
+    assert_eq!(s["jobs"], 2, "{s}");
+    assert_eq!(s["loaded_model"], "m");
+    assert!(s["peak_voice_rss_mib"].as_f64().unwrap() > 0.0, "{s}");
+    drop(client);
+    let proc_dir = PathBuf::from(format!("/proc/{voice_pid}"));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while scratch() || proc_dir.exists() || !status(&run.socket).await["voice_worker"].is_null()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(chat.await.unwrap().starts_with("HTTP/1.1 200"));
+    assert_eq!(run.supervisor.state.lock().unwrap().pid, Some(text_pid));
+    assert_eq!(
+        logged(run._dir.path()).last().unwrap()["cache_prompt"],
+        true
+    );
+}
+
 /// A Moonshine folder runs on sherpa-onnx, whose result line on standard
 /// output is the transcript; it is asked for English only, and the default
 /// speech model is marked in the model list.
@@ -423,6 +511,18 @@ async fn sherpa_speech_is_read_from_its_output_line() {
         ok.starts_with("HTTP/1.1 200") && ok.contains(r#""text":"After early nightfall.""#),
         "{ok}"
     );
+    for directed in [false, true] {
+        let response = send(&run.socket, post(
+            "/v1/audio/voice-transcriptions",
+            &json!({"model":"moonshine","language":"en","wav_base64":audio,"directed":directed}),
+        )).await;
+        let expected = if directed {
+            "HTTP/1.1 200"
+        } else {
+            "HTTP/1.1 503"
+        };
+        assert!(response.starts_with(expected), "{response}");
+    }
     let german = send(
         &run.socket,
         post(

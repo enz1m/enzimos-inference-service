@@ -59,6 +59,8 @@ pub struct State {
     pub loaded: Option<String>,
     pub backend: Option<String>,
     pub profile: Value,
+    voice_worker: Option<(u32, String, u32)>,
+    peak_voice_rss_mib: f64,
 }
 
 /// The native worker; held across a request, so one job runs at a time.
@@ -111,6 +113,7 @@ pub struct Supervisor {
     pub state: Mutex<State>,
     pub engine: tokio::sync::Mutex<Engine>,
     pub directory: PathBuf,
+    speech_lane: tokio::sync::Mutex<()>,
     base: Value,
     preferences: Mutex<Preferences>,
     uid: u32,
@@ -120,6 +123,15 @@ pub struct Supervisor {
 
 const IDLE_MEMORY_RESERVE_MIB: f64 = 768.0;
 const PRELOAD_IDLE_SECONDS: u64 = 30;
+const VOICE_MEMORY_MIB: u64 = 768;
+const VOICE_MODEL_BYTES: u64 = 96 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpeechMode {
+    Dictation,
+    Benchmark,
+    Voice { directed: bool },
+}
 
 fn available_memory_mib() -> Option<f64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -127,6 +139,63 @@ fn available_memory_mib() -> Option<f64> {
         .lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))?;
     Some(kib.split_whitespace().next()?.parse::<f64>().ok()? / 1024.0)
+}
+
+fn cgroup_memory_headroom_mib() -> Option<f64> {
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let group = groups.lines().find_map(|line| line.strip_prefix("0::/"))?;
+    let root = Path::new("/sys/fs/cgroup");
+    let mut headroom = f64::INFINITY;
+    for group in root
+        .join(group)
+        .ancestors()
+        .take_while(|dir| dir.starts_with(root))
+    {
+        let Ok(limit) = std::fs::read_to_string(group.join("memory.max")) else {
+            continue;
+        };
+        if limit.trim() == "max" {
+            continue;
+        }
+        let limit = limit.trim().parse::<u64>().ok()?;
+        let used = std::fs::read_to_string(group.join("memory.current")).ok()?;
+        headroom =
+            headroom.min(limit.saturating_sub(used.trim().parse().ok()?) as f64 / 1_048_576.0);
+    }
+    Some(headroom)
+}
+
+fn voice_model_fits(item: &Value) -> bool {
+    matches!(item["architecture"].as_str(), None | Some("whisper"))
+        && item["path"]
+            .as_str()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .is_some_and(|file| file.len() <= VOICE_MODEL_BYTES)
+}
+
+fn voice_admitted(
+    text_budget: f64,
+    text_resident: f64,
+    host_available: Option<f64>,
+    cgroup_available: Option<f64>,
+) -> bool {
+    let needed = VOICE_MEMORY_MIB as f64 + (text_budget - text_resident).max(0.0);
+    host_available.is_some_and(|mib| mib >= needed + IDLE_MEMORY_RESERVE_MIB)
+        && cgroup_available.is_some_and(|mib| mib >= needed + 64.0)
+}
+
+#[cfg(test)]
+mod voice_admission_tests {
+    use super::*;
+
+    #[test]
+    fn voice_reserves_room_for_text_growth_and_the_desktop() {
+        assert!(voice_admitted(1900.0, 1800.0, Some(1800.0), Some(1000.0)));
+        assert!(!voice_admitted(1900.0, 0.0, Some(1800.0), Some(1000.0)));
+        assert!(!voice_admitted(1900.0, 1800.0, Some(1300.0), Some(1000.0)));
+        assert!(!voice_admitted(1900.0, 1800.0, Some(2000.0), Some(900.0)));
+        assert!(!voice_admitted(1900.0, 1800.0, Some(2000.0), None));
+    }
 }
 
 const PREFERENCE_KEYS: [&str; 6] = [
@@ -172,13 +241,18 @@ impl Drop for Abort<'_> {
 struct Speech<'a> {
     supervisor: &'a Supervisor,
     scratch: PathBuf,
+    parallel: bool,
 }
 impl Drop for Speech<'_> {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch);
         let mut state = self.supervisor.state.lock().unwrap();
-        state.pid = None;
-        state.loaded = None;
+        if self.parallel {
+            state.voice_worker = None;
+        } else {
+            state.pid = None;
+            state.loaded = None;
+        }
     }
 }
 
@@ -253,8 +327,11 @@ impl Supervisor {
                 loaded: None,
                 backend: None,
                 profile: Value::Null,
+                voice_worker: None,
+                peak_voice_rss_mib: 0.0,
             }),
             engine: tokio::sync::Mutex::new(Engine::default()),
+            speech_lane: tokio::sync::Mutex::new(()),
             directory: directory.to_path_buf(),
             base,
             preferences: Mutex::new(preferences),
@@ -435,7 +512,7 @@ impl Supervisor {
                 )),
                 None => env.push(("MESA_SHADER_CACHE_DISABLE".into(), "true".into())),
             }
-            let mut child = spawn(&args, &env, cpus.clone(), None, true)
+            let mut child = spawn(&args, &env, cpus.clone(), None, true, None)
                 .map_err(|_| unavailable("runtime could not start"))?;
             let diagnostic = child
                 .stderr
@@ -691,10 +768,10 @@ impl Supervisor {
         }
     }
 
-    pub async fn transcribe(
+    async fn transcribe(
         &self,
         body: Map<String, Value>,
-        benchmark: bool,
+        mode: SpeechMode,
     ) -> Result<Option<(u16, Value)>, Failure> {
         if self.state.lock().unwrap().jobs >= 2 {
             return Ok(Some((429, json!({"error": "local inference busy"}))));
@@ -728,31 +805,59 @@ impl Supervisor {
         if audio.len() > 2 * 1024 * 1024 {
             return Err(bad("audio too large"));
         }
-        wav_shape(&audio)?;
+        let frames = wav_frames(&audio)?;
+        let voice = matches!(mode, SpeechMode::Voice { .. });
+        if voice && frames > 16_000 * 12 {
+            return Err(bad("voice audio exceeds 12 seconds"));
+        }
         let Ok(_job) = self.admit() else {
             return Ok(Some((429, json!({"error": "local inference busy"}))));
         };
-        let cli = plan.cli().to_owned();
-        let mut engine = self.engine.lock().await;
-        self.stop(&mut engine).await;
+        let _lane = if voice {
+            let Ok(lane) = self.speech_lane.try_lock() else {
+                return Ok(Some((
+                    429,
+                    json!({"error": "local speech recognition busy"}),
+                )));
+            };
+            lane
+        } else {
+            self.speech_lane.lock().await
+        };
+        let voice_cpu = voice
+            .then(|| self.voice_cpu(&plan, &config, &model))
+            .flatten();
+        let parallel = voice_cpu.is_some();
+        let mut serial_engine = None;
+        if !parallel {
+            if mode == (SpeechMode::Voice { directed: false }) {
+                return Err(unavailable(
+                    "background voice recognition resources unavailable",
+                ));
+            }
+            let mut engine = self.engine.lock().await;
+            self.stop(&mut engine).await;
+            serial_engine = Some(engine);
+        }
+        let _serial_engine = serial_engine;
+        let cli = plan.cli();
         let scratch = tempfile_dir(&self.directory)
             .map_err(|_| unavailable("speech workspace unavailable"))?;
-        // Cancellation drops this future mid-wait: the guard still deletes the
-        // user's audio and clears the worker identity the monitor watches.
         let _cleanup = Speech {
             supervisor: self,
             scratch: scratch.clone(),
+            parallel,
         };
         async {
             let wav = scratch.join("audio.wav");
             std::fs::write(&wav, &audio)
                 .map_err(|_| unavailable("speech workspace unavailable"))?;
-            let cpus = self.worker_cpus();
+            let cpus = voice_cpu.map_or_else(|| self.worker_cpus(), |cpu| vec![cpu]);
             let args = plan.args(&config["models"][&model], &wav, &scratch, cpus.len());
-            let env = [
+            let mut env = vec![
                 (
                     "LD_LIBRARY_PATH".to_owned(),
-                    Path::new(&cli)
+                    Path::new(cli)
                         .parent()
                         .unwrap()
                         .to_string_lossy()
@@ -764,26 +869,38 @@ impl Supervisor {
                 ),
                 ("OMP_NUM_THREADS".to_owned(), cpus.len().to_string()),
             ];
-            let mut child = spawn(&args, &env, cpus, plan.output(&scratch).as_deref(), false)
-                .map_err(|_| unavailable("speech runtime could not start"))?;
+            if parallel {
+                env.push(("MALLOC_ARENA_MAX".to_owned(), "2".to_owned()));
+            }
+            let mut child = spawn(
+                &args,
+                &env,
+                cpus,
+                plan.output(&scratch).as_deref(),
+                false,
+                parallel.then_some(VOICE_MEMORY_MIB * 1_048_576),
+            )
+            .map_err(|_| unavailable("speech runtime could not start"))?;
             {
                 let mut s = self.state.lock().unwrap();
-                s.pid = child.id();
-                s.loaded = Some(model.clone());
-                s.backend = Some("cpu".into());
+                if let Some(cpu) = voice_cpu {
+                    s.voice_worker = child.id().map(|pid| (pid, model.clone(), cpu));
+                } else {
+                    s.pid = child.id();
+                    s.loaded = Some(model.clone());
+                    s.backend = Some("cpu".into());
+                    s.failure = None;
+                }
             }
+            self.started.notify_one();
             let started = Instant::now();
-            let wait = tokio::time::timeout(Duration::from_secs(120), child.wait());
-            let (status, memory) = if benchmark {
+            let seconds = if voice { 30 } else { 120 };
+            let wait = tokio::time::timeout(Duration::from_secs(seconds), child.wait());
+            let (status, memory) = if mode == SpeechMode::Benchmark {
                 benchmark::measure_memory(self, wait).await
             } else {
                 (wait.await, 0.0)
             };
-            {
-                let mut s = self.state.lock().unwrap();
-                s.pid = None;
-                s.loaded = None;
-            }
             let status = match status {
                 Ok(Ok(status)) => status,
                 _ => {
@@ -791,7 +908,9 @@ impl Supervisor {
                     return Err(unavailable("speech inference timed out"));
                 }
             };
-            let failure = self.state.lock().unwrap().failure.clone();
+            let failure = (!parallel)
+                .then(|| self.state.lock().unwrap().failure.clone())
+                .flatten();
             let text = status
                 .success()
                 .then(|| plan.transcript(&scratch))
@@ -799,7 +918,7 @@ impl Supervisor {
                 .ok_or_else(|| {
                     unavailable(failure.unwrap_or_else(|| "speech inference failed".into()))
                 })?;
-            if benchmark {
+            if mode == SpeechMode::Benchmark {
                 return Ok(Some((
                     200,
                     json!({
@@ -814,16 +933,46 @@ impl Supervisor {
         .await
     }
 
+    fn voice_cpu(&self, plan: &speech::Plan, config: &Value, model: &str) -> Option<u32> {
+        if !matches!(plan, speech::Plan::Whisper { .. })
+            || !voice_model_fits(&config["models"][model])
+        {
+            return None;
+        }
+        let cpus = cpu_budget(Some(2));
+        if cpus.len() < 2 {
+            return None;
+        }
+        let pid = self.state.lock().unwrap().pid;
+        let resident = pid.map_or(0.0, |pid| rss_mib(pid) + driver_ram_mib(pid));
+        voice_admitted(
+            policy::memory_mib(config),
+            resident,
+            available_memory_mib(),
+            cgroup_memory_headroom_mib(),
+        )
+        .then_some(cpus[0])
+    }
+
     /// Enforce the RAM budget and unload an idle worker.
     pub async fn monitor(self: Arc<Self>) {
         loop {
-            let pid = self.state.lock().unwrap().pid;
-            if pid.is_some() {
+            let active = {
+                let state = self.state.lock().unwrap();
+                state.pid.is_some() || state.voice_worker.is_some()
+            };
+            if active {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             } else {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(5)) => {}
                     () = self.started.notified() => continue,
+                }
+            }
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some((pid, _, _)) = state.voice_worker {
+                    state.peak_voice_rss_mib = state.peak_voice_rss_mib.max(rss_mib(pid));
                 }
             }
             let Some(pid) = self.state.lock().unwrap().pid else {
@@ -915,18 +1064,25 @@ impl Supervisor {
     fn status(&self) -> Value {
         let s = self.state.lock().unwrap();
         json!({"ready": true, "loaded_model": s.loaded, "backend": s.backend, "installed_runtimes": s.config["runtimes"].as_object().map(|r| r.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-               "profile": s.profile, "jobs": s.jobs, "worker_cpus": s.hw["worker_cpus"], "peak_worker_rss_mib": s.peak_rss_mib, "peak_driver_ram_mib": s.peak_driver_ram_mib, "failure": s.failure})
+               "profile": s.profile, "jobs": s.jobs, "worker_cpus": s.hw["worker_cpus"], "peak_worker_rss_mib": s.peak_rss_mib, "peak_driver_ram_mib": s.peak_driver_ram_mib, "failure": s.failure,
+               "voice_worker": s.voice_worker.as_ref().map(|(pid, model, cpu)| json!({"pid":pid, "model":model, "cpu":cpu})),
+               "peak_voice_rss_mib": s.peak_voice_rss_mib})
     }
 
     pub async fn serve(self: Arc<Self>, listener: UnixListener) {
+        let mut clients = tokio::task::JoinSet::new();
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                // Back off on descriptor exhaustion instead of spinning.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            };
-            let supervisor = self.clone();
-            tokio::spawn(async move { supervisor.client(stream).await });
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((stream, _)) = accepted {
+                        let supervisor = self.clone();
+                        clients.spawn(async move { supervisor.client(stream).await });
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                _ = clients.join_next(), if !clients.is_empty() => {}
+            }
         }
     }
 
@@ -1002,6 +1158,9 @@ impl Supervisor {
                         if let Some(architecture) = m.get("architecture") {
                             entry["architecture"] = architecture.clone();
                         }
+                        if m["kind"] == "speech" && voice_model_fits(m) {
+                            entry["voice_parallel"] = json!(true);
+                        }
                         if config["default_model"] == *id || config["default_speech_model"] == *id {
                             entry["default"] = json!(true);
                         }
@@ -1038,7 +1197,14 @@ impl Supervisor {
         // The caller disconnecting cancels the job; Abort and Job guards clean up.
         let operation = async {
             match path {
-                "/v1/audio/transcriptions" => self.transcribe(body, false).await,
+                "/v1/audio/transcriptions" => self.transcribe(body, SpeechMode::Dictation).await,
+                "/v1/audio/voice-transcriptions" => {
+                    let directed = match body.get("directed").and_then(Value::as_bool) {
+                        Some(directed) => directed,
+                        None => return Err(bad("voice transcription requires directed flag")),
+                    };
+                    self.transcribe(body, SpeechMode::Voice { directed }).await
+                }
                 "/v1/models/benchmark" => self.benchmark(body).await,
                 "/v1/models/warmup" => self.warmup(body).await,
                 _ => self.proxy(path, body, writer, started).await,
@@ -1084,6 +1250,10 @@ async fn client_gone(reader: &mut tokio::net::unix::OwnedReadHalf) {
 
 /// 16 kHz mono 16-bit PCM WAV, at most 60 seconds.
 pub fn wav_shape(audio: &[u8]) -> Result<(), Failure> {
+    wav_frames(audio).map(|_| ())
+}
+
+fn wav_frames(audio: &[u8]) -> Result<usize, Failure> {
     let refuse = || bad("16kHz mono PCM WAV, at most 60s required");
     if audio.len() < 12 || &audio[..4] != b"RIFF" || &audio[8..12] != b"WAVE" {
         return Err(refuse());
@@ -1124,7 +1294,7 @@ pub fn wav_shape(audio: &[u8]) -> Result<(), Failure> {
         }
     }
     match (format, frames) {
-        (Some((1, 1, 16000, 16)), Some(frames)) if frames <= 16000 * 60 => Ok(()),
+        (Some((1, 1, 16000, 16)), Some(frames)) if frames <= 16000 * 60 => Ok(frames),
         _ => Err(refuse()),
     }
 }
