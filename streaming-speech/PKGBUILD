@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT
+pkgname=enzimos-streaming-speech
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Offline streaming English recognition for enzimOS Voice Typing'
+arch=('x86_64')
+url='https://github.com/enz1m/enzimos-inference-service'
+license=('MIT' 'Apache-2.0' 'LicenseRef-Kroko-Community-CC-BY-SA')
+depends=('glibc' 'gcc-libs' 'pipewire-audio' 'systemd-libs')
+makedepends=('python')
+options=('!debug' '!strip' '!lto')
+_sherpa=v2.0.3
+_runtime=1.28.2
+_sherpa_release="sherpa-onnx-$_sherpa-linux-x64-shared-no-tts-lib"
+_runtime_release="onnxruntime-linux-x64-glibc2_17-Release-$_runtime"
+_model='https://huggingface.co/Banafo/Kroko-ASR/resolve/d45212aeb212dd66083dd22710c9954f40ff8cc1'
+_bundle='Kroko-EN-Community-64-L-Streaming-001.data'
+source=(
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/$_sherpa/$_sherpa_release.tar.bz2"
+    "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/$_sherpa/sherpa-onnx/c-api/c-api.h"
+    "sherpa-LICENSE::https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/$_sherpa/LICENSE"
+    "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v$_runtime/$_runtime_release.zip"
+    "$_model/$_bundle"
+    "kroko-model-card.md::$_model/README.md"
+    'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx'
+    'silero-LICENSE::https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.1/LICENSE'
+)
+sha256sums=(
+    '7e8dcc277dfab8efdb4a3461df46983fa565a95313732ecb4ae1682f0b3ff58d'
+    '1f738de63a206328253ff471edda96b011fa1bd6f2a028f82967a7761abc2edd'
+    'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30'
+    'c4f8994d56191d9d2c92a961b39fe790459f2c5d155f912b239506ea31359534'
+    '59a1e64cfbe33d35096f69056c484f02778a5d2c0c95016d3e2948588fc72e9c'
+    '5dcbcb53450162e604596fbeffe0d0e22f87ff7294fbdd3f7dd1ae2011e72dc9'
+    '9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6'
+    '2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b'
+)
+
+build() {
+    python "$startdir/unpack-kroko.py" "$srcdir/$_bundle" "$srcdir/kroko"
+    local lib="$srcdir/$_sherpa_release/lib"
+    "${CC:-cc}" $CFLAGS $CPPFLAGS -std=c11 -pthread -I "$srcdir" "$startdir/worker.c" \
+        -L "$lib" -Wl,-rpath-link,"$lib" -Wl,-rpath,'$ORIGIN' $LDFLAGS \
+        -lsherpa-onnx-c-api -lsystemd -o "$srcdir/enzimos-streaming-speech"
+}
+
+package() {
+    local dest="$pkgdir/usr/lib/enzimos-inference/streaming-speech"
+    local notices="$pkgdir/usr/share/licenses/$pkgname"
+    local units="$pkgdir/usr/lib/systemd/user"
+    install -Dm755 "$srcdir/enzimos-streaming-speech" "$dest/enzimos-streaming-speech"
+    install -Dm644 -t "$dest" "$srcdir/kroko/"* "$srcdir/silero_vad.onnx"
+    install -Dm755 -t "$dest" "$srcdir/$_sherpa_release/lib/"{libsherpa-onnx-c-api,libonnxruntime}.so
+    install -Dm644 "$startdir/enzimos-streaming-speech.service" "$units/enzimos-streaming-speech.service"
+    install -d "$units/enzui-session-ready.target.wants"
+    ln -s ../enzimos-streaming-speech.service "$units/enzui-session-ready.target.wants/enzimos-streaming-speech.service"
+    install -Dm644 -t "$notices" "$srcdir/"{sherpa-LICENSE,kroko-model-card.md,silero-LICENSE}
+    install -Dm644 "$srcdir/$_runtime_release/LICENSE" "$notices/onnxruntime-LICENSE"
+    install -Dm644 "$srcdir/$_runtime_release/ThirdPartyNotices.txt" "$notices/onnxruntime-ThirdPartyNotices.txt"
+    install -Dm644 "$startdir/../LICENSE" "$notices/enzimos-inference-service-LICENSE"
+}

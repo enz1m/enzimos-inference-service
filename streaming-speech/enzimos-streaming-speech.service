@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=enzimOS local streaming speech recognition
+After=pipewire.service wireplumber.service
+PartOf=enzui-session-ready.target
+ConditionPathExists=!%E/enzimos/local-ai-disabled
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/rm -f %t/enzimos-streaming-speech/service.sock
+ExecStart=/usr/lib/enzimos-inference/streaming-speech/enzimos-streaming-speech %t/enzimos-streaming-speech/service.sock
+WorkingDirectory=/usr/lib/enzimos-inference/streaming-speech
+RuntimeDirectory=enzimos-streaming-speech
+RuntimeDirectoryMode=0700
+UMask=0077
+Nice=10
+CPUQuota=100%
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=32
+LimitAS=768M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX
+Restart=on-failure
+
+[Install]
+WantedBy=enzui-session-ready.target
