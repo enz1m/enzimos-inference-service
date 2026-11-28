@@ -996,8 +996,19 @@ impl Supervisor {
                         if entry["kind"] == "llm" {
                             entry["context"] = json!(policy::context_for_model(&config, id));
                         }
-                        if let Some(title) = m.get("title").filter(|title| title.is_string()) {
-                            entry["title"] = title.clone();
+                        let title = match m.get("title").and_then(Value::as_str) {
+                            // Existing registries store the artifact stem for the bundled Whisper model.
+                            Some("ggml-base-q5_1")
+                                if id == "whisper-base"
+                                    && entry["kind"] == "speech"
+                                    && m["architecture"] == "whisper" =>
+                            {
+                                Some("Whisper base")
+                            }
+                            title => title,
+                        };
+                        if let Some(title) = title {
+                            entry["title"] = json!(title);
                         }
                         if let Some(architecture) = m.get("architecture") {
                             entry["architecture"] = architecture.clone();

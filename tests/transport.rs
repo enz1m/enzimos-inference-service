@@ -305,6 +305,38 @@ async fn idle_worker_is_unloaded() {
     let _ = &run.supervisor;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn model_list_names_the_bundled_whisper_model_in_existing_registries() {
+    let run = start(|config, dir| {
+        let model = dir.join("ggml-base-q5_1.bin");
+        std::fs::write(&model, b"lmggfixture").unwrap();
+        let digest = enzimos_inference_service::policy::file_sha256(&model).unwrap();
+        config["models"]["whisper-base"] = json!({
+            "path": model,
+            "kind": "speech",
+            "architecture": "whisper",
+            "sha256": digest,
+            "title": "ggml-base-q5_1"
+        });
+        config["models"]["voice"] = config["models"]["whisper-base"].clone();
+    })
+    .await;
+    let reply = send(&run.socket, "GET /v1/models HTTP/1.1\r\n\r\n".into()).await;
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    let (_, body) = reply.split_once("\r\n\r\n").unwrap();
+    let response: Value = serde_json::from_str(body).unwrap();
+    let models = response["data"].as_array().unwrap();
+    let title = |id| {
+        models
+            .iter()
+            .find(|model| model["id"] == id)
+            .and_then(|model| model["title"].as_str())
+            .unwrap()
+    };
+    assert_eq!(title("whisper-base"), "Whisper base");
+    assert_eq!(title("voice"), "ggml-base-q5_1");
+}
+
 fn wav(seconds: u32, rate: u32, channels: u16) -> Vec<u8> {
     let data = vec![0u8; (seconds * rate * u32::from(channels) * 2) as usize];
     let mut out = b"RIFF".to_vec();
